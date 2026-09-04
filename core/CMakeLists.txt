@@ -1,4 +1,4 @@
-add_library(core STATIC src/placeholder.cpp)
+add_library(core STATIC src/distance.cpp)
 target_include_directories(core PUBLIC include)
 
 include(FetchContent)
