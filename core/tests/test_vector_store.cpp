@@ -79,6 +79,14 @@ TEST(VectorStore, LoadRejectsBadMagic) {
     std::remove("bad_magic.bin");
 }
 
+TEST(VectorStore, LoadRejectsShortHeader) {
+    // 短于 16 字节的"半截文件"：头都不完整，必须干净拒绝
+    { std::ofstream f("short_header.bin", std::ios::binary); f << "CRV1" << "xxxx"; }
+    VectorStore vs(2);
+    EXPECT_THROW(vs.load("short_header.bin"), std::runtime_error);
+    std::remove("short_header.bin");
+}
+
 TEST(VectorStore, LoadRejectsDimMismatch) {
     { std::ofstream f("bad_dim.bin", std::ios::binary);
       f.write("CRV1", 4);

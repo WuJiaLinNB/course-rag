@@ -1,5 +1,6 @@
 ﻿#include <core/vector_store.hpp>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <cstring>
 #include <string>
@@ -44,6 +45,9 @@ void VectorStore::add(std::vector<float> v) {
 size_t VectorStore::size() const { return flat_.size() / dim_; }
 size_t VectorStore::dim() const { return dim_; }
 std::vector<float> VectorStore::get(size_t i) const {
+    if (i >= size())
+        throw std::out_of_range("VectorStore::get: index " + std::to_string(i)
+                                + " >= size " + std::to_string(size()));
     return std::vector<float>(flat_.begin() + i * dim_,
                               flat_.begin() + (i + 1) * dim_);
 }
@@ -76,6 +80,7 @@ void VectorStore::load(const std::string& path) {
     f.read((char*)&version, 4);
     f.read((char*)&dim32, 4);
     f.read((char*)&count, 4);
+    if (!f) throw std::runtime_error("vectors.bin header incomplete: " + path);
     if (std::memcmp(magic, kMagic, 4) != 0)
         throw std::runtime_error("bad magic: not a CRV1 vectors file");
     if (version != kVersion)
@@ -88,10 +93,13 @@ void VectorStore::load(const std::string& path) {
     const auto bytes = (size_t)f.tellg();
     if (bytes != 16 + (size_t)count * dim_ * sizeof(float))
         throw std::runtime_error("file size inconsistent with header count");
-    flat_.resize((size_t)count * dim_);
+    // 先读入局部缓冲，全部成功后才换入成员（强异常保证：失败不留中间态）
+    std::vector<float> tmp;
+    tmp.resize((size_t)count * dim_);
     f.seekg(16, std::ios::beg);
-    f.read((char*)flat_.data(), (std::streamsize)(flat_.size() * sizeof(float)));
+    f.read((char*)tmp.data(), (std::streamsize)(tmp.size() * sizeof(float)));
     if (!f) throw std::runtime_error("short read: " + path);
+    flat_.swap(tmp);
 }
 
 } // namespace core
