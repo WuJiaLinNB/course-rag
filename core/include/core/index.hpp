@@ -14,7 +14,8 @@ public:
     // 追加一条已归一化向量（id = 当前容量）
     virtual void add(std::vector<float> v, const ChunkMeta& meta) = 0;
     virtual size_t size() const = 0;
-    // 返回按相似度降序的 Top-K（同分按 id 升序，保证确定性）
+    // 返回按相似度降序的 Top-K（同分按 id 升序，保证确定性）；
+    // q.size() 必须等于索引 dim，否则抛异常
     virtual std::vector<SearchItem> search(const std::vector<float>& q,
                                            size_t k,
                                            const MetaFilter& filter) const = 0;

@@ -65,3 +65,28 @@ TEST(Brute, DeterministicScores) {
         EXPECT_EQ(r1[i].similarity, r2[i].similarity);   // 逐位相等，不是 NEAR
     }
 }
+
+TEST(Brute, QueryDimMismatch) {
+    BruteIndex idx(2);
+    idx.add({1,0}, {"", "", "", ""});
+    EXPECT_THROW(idx.search({1,0,0}, 1, {}), std::invalid_argument);
+    EXPECT_THROW(idx.search({1}, 1, {}), std::invalid_argument);
+}
+
+TEST(Brute, TieEviction) {  // 堆满时同分淘汰：id 大者出局
+    BruteIndex idx(2);
+    idx.add({1,0}, {"", "", "", ""});
+    idx.add({1,0}, {"", "", "", ""});
+    idx.add({1,0}, {"", "", "", ""});   // 三条同分，k=2 → 应留 id 0、1
+    auto r = idx.search({1,0}, 2, {});
+    ASSERT_EQ(r.size(), 2u);
+    EXPECT_EQ(r[0].id, 0u);
+    EXPECT_EQ(r[1].id, 1u);
+}
+
+TEST(Brute, FilterNoMatch) {  // pre-filter 无候选 → 空结果
+    BruteIndex idx(2);
+    idx.add({1,0}, {"", "", "", ""});
+    MetaFilter f; f.course = "nope";
+    EXPECT_TRUE(idx.search({1,0}, 3, f).empty());
+}

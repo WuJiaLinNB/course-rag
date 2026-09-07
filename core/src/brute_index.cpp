@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <queue>
+#include <stdexcept>
 
 namespace core {
 
@@ -36,6 +37,7 @@ std::vector<SearchItem> BruteIndex::search(const std::vector<float>& q,
                                            const MetaFilter& filter) const {
     const size_t n = store_.size();
     const size_t dim = store_.dim();
+    if (q.size() != dim) throw std::invalid_argument("query dim mismatch");
     const float* raw = store_.raw();
 
     // pre-filter：先筛候选 id（元数据不满足的直接不参与算分）

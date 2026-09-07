@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <core/index.hpp>
 #include <core/vector_store.hpp>
+#include <string>
 #include <vector>
 
 namespace core {
