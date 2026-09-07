@@ -1,4 +1,4 @@
-add_library(core STATIC src/distance.cpp src/vector_store.cpp src/brute_index.cpp)
+add_library(core STATIC src/distance.cpp src/vector_store.cpp src/brute_index.cpp src/kmeans.cpp)
 target_include_directories(core PUBLIC include)
 
 include(FetchContent)
