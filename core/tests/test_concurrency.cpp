@@ -101,3 +101,38 @@ TEST(Engine, LoadRejectsCountMismatch) {
     EXPECT_THROW(eng.load(path, metas), std::runtime_error);
     std::remove(path.c_str());
 }
+
+TEST(Engine, PersistRoundtripBruteOnly) {  // persist 落盘 → 新 Engine 载入 → 检索一致（优雅停机的数据链路）
+    const std::string path = "persist_roundtrip.bin";
+    const size_t dim = 4;
+    std::vector<float> q;
+    {
+        Engine eng(dim, Engine::Mode::BruteOnly);
+        std::mt19937 rng(13);
+        std::normal_distribution<float> g(0, 1);
+        for (int i = 0; i < 20; ++i) {
+            std::vector<float> v(dim);
+            for (auto& x : v) x = g(rng);
+            eng.add(v, {"", "", "", ""});
+        }
+        q.resize(dim);
+        for (auto& x : q) x = g(rng);
+        EXPECT_TRUE(eng.dirty());                 // 有未落盘数据
+        eng.persist(path);                        // 原子落盘（Task 3 的 .tmp+rename）
+        EXPECT_FALSE(eng.dirty());                // 落盘成功后清除
+        auto r1 = eng.search(q, 1, {});
+        ASSERT_EQ(r1.size(), 1u);
+        // r1 与 r2 在同一作用域比对：直接在这里建第二个 Engine，落盘-载入后逐位一致
+        Engine eng2(dim, Engine::Mode::BruteOnly);
+        std::vector<ChunkMeta> metas(20, {"", "", "", ""});
+        eng2.load(path, metas);                   // BruteOnly：不触发后台重建
+        EXPECT_EQ(eng2.size(), 20u);
+        EXPECT_FALSE(eng2.index_ready());
+        EXPECT_EQ(eng2.active_index_name(), "brute");
+        auto r2 = eng2.search(q, 1, {});
+        ASSERT_EQ(r2.size(), 1u);
+        EXPECT_EQ(r1[0].id, r2[0].id);            // brute 是确定性 ground truth → 逐位一致
+        EXPECT_EQ(r1[0].similarity, r2[0].similarity);
+    }
+    std::remove(path.c_str());
+}

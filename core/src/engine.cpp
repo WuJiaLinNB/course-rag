@@ -94,14 +94,19 @@ void Engine::load(const std::string& vectors_path,
             rebuild_thread_.join();
         rebuilding_ = true;
         rebuild_thread_ = std::thread([this, snap = std::move(loaded), metas] {
-            auto ni = std::make_unique<HnswIndex>(dim_, 16, 200);   // 独立新实例，不碰在线索引
-            for (size_t i = 0; i < snap.size(); ++i) ni->add(snap.get(i), metas[i]);
-            {
-                std::unique_lock lk(mtx_);
-                hnsw_ = std::move(ni);          // 锁内原子指针交换 = 热切换
+            try {
+                auto ni = std::make_unique<HnswIndex>(dim_, /*M=*/16, /*efC=*/200);   // 独立新实例，不碰在线索引
+                for (size_t i = 0; i < snap.size(); ++i) ni->add(snap.get(i), metas[i]);
+                {
+                    std::unique_lock lk(mtx_);
+                    hnsw_ = std::move(ni);          // 锁内原子指针交换 = 热切换
+                }
+                LOG_INFO("hnsw rebuild done, hot-swapped");
+            } catch (const std::exception& e) {
+                // 重建失败不致命：hnsw_ 保持空，brute 继续服务（降级路径兜底）
+                LOG_ERROR("hnsw rebuild failed: %s", e.what());
             }
             rebuilding_ = false;
-            LOG_INFO("hnsw rebuild done, hot-swapped");
         });
     } catch (const std::exception& e) {
         LOG_ERROR("engine load failed: %s", e.what());   // 致命错误：记日志后原样上抛
