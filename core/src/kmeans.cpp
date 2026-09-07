@@ -10,6 +10,34 @@
 //    （外部按编号取中心会错位），保留旧中心即可维持编号稳定。
 namespace core {
 
+namespace {
+
+// 任一方范数为 0 时返回 -2.0f（压不过 best 哨兵 -2.0f）→ 该点永不选此簇，
+// 空簇保留旧中心的规则自然接管；否则 cosine 会抛异常，IVF 训练直接崩。
+float cosine_or_floor(const std::vector<float>& a, const std::vector<float>& b) {
+    float na = 0.0f, nb = 0.0f;
+    for (float x : a) na += x * x;
+    for (float x : b) nb += x * x;
+    if (na <= 0.0f || nb <= 0.0f) return -2.0f;
+    return cosine(a, b);
+}
+
+// 分配：每点归余弦相似度最大的中心
+void assign_points(const std::vector<std::vector<float>>& data,
+                   const std::vector<std::vector<float>>& centroids,
+                   std::vector<uint32_t>& assign) {
+    for (size_t i = 0; i < data.size(); ++i) {
+        float best = -2.0f; size_t bi = 0;
+        for (size_t c = 0; c < centroids.size(); ++c) {
+            float s = cosine_or_floor(data[i], centroids[c]);   // 越大越近
+            if (s > best) { best = s; bi = c; }
+        }
+        assign[i] = (uint32_t)bi;
+    }
+}
+
+} // namespace
+
 KMeansResult kmeans(const std::vector<std::vector<float>>& data,
                     size_t k, size_t iters) {
     const size_t n = data.size(), dim = data.empty() ? 0 : data[0].size();
@@ -22,15 +50,8 @@ KMeansResult kmeans(const std::vector<std::vector<float>>& data,
     for (size_t i = 0; i < k; ++i) r.centroids.push_back(data[pick(rng)]);
 
     for (size_t it = 0; it < iters; ++it) {
-        // 1. 分配：每点归最近中心（余弦距离 = 1 - 相似度，或欧氏）
-        for (size_t i = 0; i < n; ++i) {
-            float best = -2.0f; size_t bi = 0;
-            for (size_t c = 0; c < r.centroids.size(); ++c) {
-                float s = cosine(data[i], r.centroids[c]);   // 越大越近
-                if (s > best) { best = s; bi = c; }
-            }
-            r.assign[i] = (uint32_t)bi;
-        }
+        // 1. 分配：每点归余弦相似度最大的中心
+        assign_points(data, r.centroids, r.assign);
         // 2. 更新：中心 = 成员均值
         std::vector<std::vector<float>> sum(r.centroids.size(),
                                             std::vector<float>(dim, 0.0f));
@@ -45,6 +66,8 @@ KMeansResult kmeans(const std::vector<std::vector<float>>& data,
                 r.centroids[c][d] = sum[c][d] / (float)cnt[c];
         }
     }
+    // 最后一次分配与最终中心对齐，Task 6 IVF 用 assign 建桶
+    assign_points(data, r.centroids, r.assign);
     return r;
 }
 
