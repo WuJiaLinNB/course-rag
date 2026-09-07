@@ -2,7 +2,6 @@
 #include <core/index.hpp>
 #include <core/vector_store.hpp>
 #include <vector>
-#include <memory>
 
 namespace core {
 

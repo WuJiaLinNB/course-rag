@@ -58,6 +58,7 @@ void IvfIndex::maybe_train() {
     // 取出全量数据（store_ 为 SoA 扁平存储）喂给 kmeans
     const size_t dim = store_.dim();
     const float* raw = store_.raw();
+    // 瞬时拷贝 ≈ 库大小（10 万×1024 维约 400MB，预算内）；1.5x 节流限制重训频率，增长全程最多 O(log1.5 n) 次
     std::vector<std::vector<float>> data;
     data.reserve(n);
     for (size_t i = 0; i < n; ++i)
@@ -81,12 +82,13 @@ void IvfIndex::assign_new_points() {
     const float* raw = store_.raw();
     for (size_t i = bucket_of_.size(); i < store_.size(); ++i) {
         const float* v = raw + i * dim;
+        double vc = 0.0;                        // v 的范数²：与中心无关，提出中心循环
+        for (size_t d = 0; d < dim; ++d) vc += (double)v[d] * (double)v[d];
         float best = -2.0f; size_t bi = 0;      // -2.0 哨兵：零范数中心永不选中（同 kmeans）
         for (size_t c = 0; c < centroids_.size(); ++c) {
-            double s = 0.0, vc = 0.0, cc = 0.0;
+            double s = 0.0, cc = 0.0;
             for (size_t d = 0; d < dim; ++d) {
                 s += (double)v[d] * (double)centroids_[c][d];
-                vc += (double)v[d] * (double)v[d];
                 cc += (double)centroids_[c][d] * (double)centroids_[c][d];
             }
             if (cc <= 0.0) continue;            // 零范数中心跳过（成员相消时可能出现）
