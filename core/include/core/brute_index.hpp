@@ -17,6 +17,8 @@ public:
                                    size_t k,
                                    const MetaFilter& filter) const override;
     std::string name() const override { return "brute"; }
+    // v1 persist 转发：VectorStore 是唯一权威数据源，原子写直接复用（Engine::persist 转调）
+    void save_vectors(const std::string& path) const { store_.save(path); }
 private:
     VectorStore store_;
     std::vector<ChunkMeta> metas_;
