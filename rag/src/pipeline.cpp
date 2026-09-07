@@ -1,6 +1,7 @@
 ﻿#include <rag/pipeline.hpp>
 #include <httplib.h>
 #include <json.hpp>   // nlohmann/json v3.11.3 单头（Task 12.1 的下载项提前到位，rag 先复用）
+#include <core/log.hpp>
 
 namespace rag {
 
@@ -77,23 +78,33 @@ std::string Pipeline::call_llm(const std::string& prompt) const {
 
     const auto res = cli.Post("/chat/completions", body.dump(
         -1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-    if (!res)                                   // 连接失败/超时/不支持 http scheme
+    if (!res) {                                 // 连接失败/超时/不支持 http scheme
+        LOG_WARN("llm request failed: %s", httplib::to_string(res.error()).c_str());
         return "";
-    if (res->status < 200 || res->status >= 300) // 非 2xx（鉴权失败、限流、5xx）
+    }
+    if (res->status < 200 || res->status >= 300) { // 非 2xx（鉴权失败、限流、5xx）
+        LOG_WARN("llm http status %d", static_cast<int>(res->status));
         return "";
+    }
 
     // 响应解析全程不抛异常（allow_exceptions=false）+ 逐层判存在性，
     // 外部数据任何形状不对都统一降级，而不是让异常炸穿 ask()
     auto jr = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
-    if (jr.is_discarded() || jr.contains("error"))
+    if (jr.is_discarded() || jr.contains("error")) {
+        LOG_WARN("llm response body not valid json or has error");
         return "";
-    if (!jr.contains("choices") || !jr["choices"].is_array() || jr["choices"].empty())
+    }
+    if (!jr.contains("choices") || !jr["choices"].is_array() || jr["choices"].empty()) {
+        LOG_WARN("llm response missing choices");
         return "";
+    }
     const auto& msg = jr["choices"][0];
     if (!msg.is_object() || !msg.contains("message") ||
         !msg["message"].is_object() || !msg["message"].contains("content") ||
-        !msg["message"]["content"].is_string())
+        !msg["message"]["content"].is_string()) {
+        LOG_WARN("llm response missing message content");
         return "";
+    }
     return msg["message"]["content"].get<std::string>();
 }
 

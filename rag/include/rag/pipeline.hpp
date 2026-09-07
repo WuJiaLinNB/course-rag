@@ -37,6 +37,7 @@ struct LlmConfig {
 //    fail fast + 降级文案是更可控的失败方式。
 class Pipeline {
 public:
+    // engine_ 必须比 Pipeline 活得久（server 层二者同生命周期）
     Pipeline(core::Engine& engine, LlmConfig cfg,
              std::function<std::vector<float>(const std::string&)> embed_query,
              // 原文/元数据提供者：server 层持有 chunks.json 的内存副本（core 不存原文）
