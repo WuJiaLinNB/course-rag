@@ -218,7 +218,7 @@ std::vector<SearchItem> HnswIndex::search(const std::vector<float>& q,
     // 第 0 层：ef 必须 ≥ k 才可能返回 k 条。
     // 【过关自测】efConstruction 只影响建图质量（候选池越大图越准、建得越慢）；
     // efSearch 只影响查询（候选池越大召回越高、查询越慢），两者互不替代。
-    const size_t ef = std::max(efS_, k);
+    const size_t ef = std::max<size_t>(std::max(efS_, k), 1);   // ef 至少为 1，k=0/efS=0 时与 BruteIndex 行为一致（返回空）
     auto W = search_layer_scored_(qn.data(), eps, ef, 0);
 
     // post-filter：先探索后过滤，结果可能不足 k（第一版声明限制）
@@ -238,7 +238,7 @@ std::vector<SearchItem> HnswIndex::search(const std::vector<float>& q,
 //   1) graph_[i].size() == node_level_[i]+1（层数一致）
 //   2) 各层度数 ≤ 上限（第 0 层 Mmax0_=2M，其余 Mmax_=M）
 //   3) 邻居不越界、无自环、邻居层级不低于边所在层、无重复邻居
-//   4) 第 0 层从 entry_point_ BFS 可达全部节点（连通性）
+//   4) 第 0 层从 entry_point_ DFS 可达全部节点（连通性）
 void HnswIndex::check_graph_invariants() const {
     const size_t n = store_.size();
     if (n == 0) return;
