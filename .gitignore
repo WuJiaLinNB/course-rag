@@ -2,3 +2,4 @@ build/
 build-ninja/
 data/
 *.log
+CMakeSettings.json
