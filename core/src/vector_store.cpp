@@ -1,4 +1,5 @@
-﻿#include <core/vector_store.hpp>
+#include <core/vector_store.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -38,7 +39,16 @@ void VectorStore::add(std::vector<float> v) {
     if (n2 == 0.0f)
         throw std::invalid_argument("zero vector rejected");
     float inv = 1.0f / std::sqrt(n2);
-    flat_.reserve(flat_.size() + dim_);   // 先确保容量：中途抛 bad_alloc 也不会留下半条向量
+    // 预留扩容：至少翻倍，避免每次 add 只 +dim 精确扩容（reserve 恰好填满容量 →
+    // 下次 add 必全量 realloc 拷贝 → 建 n 条总开销 O(n²)）。benchmark 实测 1 万条
+    // brute 建索引 93s 的根因；修复后与 vector 的 push_back 增长语义一致。
+    // reserve 一次性成功可保证：bad_alloc 时 flat_ 原封不动、不留半条向量。
+    const size_t need = flat_.size() + dim_;
+    if (flat_.capacity() < need) {
+        // 不用 std::max：windows.h 的 max 宏会展开污染（本文件 _WIN32 下包含）
+        const size_t grow = flat_.capacity() * 2 > need ? flat_.capacity() * 2 : need;
+        flat_.reserve(grow);
+    }
     for (float x : v) flat_.push_back(x * inv);
 }
 
