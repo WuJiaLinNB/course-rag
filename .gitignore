@@ -3,3 +3,4 @@ build-ninja/
 data/
 *.log
 CMakeSettings.json
+server_config.json

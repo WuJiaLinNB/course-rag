@@ -1,0 +1,6 @@
+{
+  "server": { "port": 8080, "auth_token": "请替换为随机长串" },
+  "embedding": { "base_url": "https://api.xxx.com", "api_key": "<key>", "model": "<模型名>" },
+  "llm": { "base_url": "https://api.xxx.com", "api_key": "<key>", "model": "<模型名>" },
+  "data": { "vectors": "data/vectors.bin", "chunks": "data/chunks.json" }
+}

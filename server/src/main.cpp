@@ -1,15 +1,19 @@
-// course-rag HTTP 服务（Task 12）：httplib + nlohmann 单头，对接 core::Engine 与 rag::Pipeline。
+// course-rag HTTP 服务（Task 12 + Task 15）：httplib + nlohmann 单头，对接 core::Engine 与 rag::Pipeline。
 //
-// 启动流程：环境变量 → data/chunks.json 内存副本（下标 = id）→ 读 vectors.bin 16 字节头
+// 启动流程：server_config.json → data/chunks.json 内存副本（下标 = id）→ 读 vectors.bin 16 字节头
 // 拿 dim → Engine 构造 + load（一致性校验在 Engine 内，失败退出）→ 监听 127.0.0.1。
-// 配置全部走环境变量，fail fast：必需变量缺失/数据文件读不了 → stderr 明确报错后 exit 1，
-// 清晰报错优于带错启动。
+// 配置全部收敛在 server_config.json（j.at() 语义：字段缺失/类型错直接抛异常，fail fast；
+// 真实配置本地持有，模板 server_config.example.json 进 git，真实文件被 .gitignore 排除）。
+//
+// 鉴权（Task 15）：/search /ask /documents 包 Bearer token 中间件（常数时间比较，缺/错一律
+// 401 不区分）；/healthz 与静态页不鉴权。静态页 web/index.html 经 set_mount_point("/", "web")
+// 托管，API 路由优先于静态文件。
 //
 // 优雅停机：控制台回调（独立线程）只调 svr.stop() 停止接收新请求；listen 返回后主线程
 // wait_rebuild → dirty 时先原子写 chunks.json 再 persist vectors.bin。回调里绝不做 flush。
 //
 // v1 限制（与 rag/src/pipeline.cpp 的 call_llm 一致）：未定义 CPPHTTPLIB_OPENSSL_SUPPORT，
-// httplib 只能发 http，https 端点会连接失败走 502；TLS 策略留给 Task 15/16。
+// httplib 只能发 http，https 端点会连接失败走 502；TLS 策略留给 Task 16。
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -49,8 +53,7 @@ namespace {
 constexpr size_t kPayloadMax = 64 * 1024 * 1024 + 1024;   // 全局入库包上限，超限 httplib 自动 413
 constexpr size_t kQueryBodyMax = 64 * 1024;               // /search /ask 请求体上限（路由内自查）
 constexpr size_t kQueryCharMax = 2000;                    // query 字符数上限（按 UTF-8 字符计）
-constexpr const char* kChunksPath = "data/chunks.json";
-constexpr const char* kVectorsPath = "data/vectors.bin";
+constexpr const char* kConfigPath = "server_config.json"; // 真实配置（.gitignore 排除），模板见 server_config.example.json
 
 // chunks.json 内存副本的并发保护：/documents 追加会让 vector 重新分配，与 Pipeline
 // 的 fetch_*（按 id 读）并发是数据竞争 → 写用 unique_lock、读用 shared_lock。
@@ -65,20 +68,63 @@ std::atomic<bool> g_service_broken{false};
 
 // ---- 启动辅助 ------------------------------------------------------------
 
-// 必需环境变量：缺失即报错退出（fail fast）
-std::string require_env(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) {
-        LOG_ERROR("missing required environment variable: %s", name);
-        std::exit(1);
-    }
-    return std::string(v);
+// 配置结构 + 加载：server_config.json，j.at() 语义（字段缺失/类型错抛异常），
+// fail fast——清晰报错优于带错启动
+struct AppConfig {
+    int port = 0;
+    std::string token;
+    std::string emb_base, emb_key, emb_model;
+    std::string llm_base, llm_key, llm_model;
+    std::string vectors_path, chunks_path;
+};
+
+AppConfig load_config(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot open config: " + path);
+    const auto j = nlohmann::json::parse(f);
+    AppConfig c;
+    c.port         = j.at("server").at("port").get<int>();
+    c.token        = j.at("server").at("auth_token").get<std::string>();
+    c.emb_base     = j.at("embedding").at("base_url").get<std::string>();
+    c.emb_key      = j.at("embedding").at("api_key").get<std::string>();
+    c.emb_model    = j.at("embedding").at("model").get<std::string>();
+    c.llm_base     = j.at("llm").at("base_url").get<std::string>();
+    c.llm_key      = j.at("llm").at("api_key").get<std::string>();
+    c.llm_model    = j.at("llm").at("model").get<std::string>();
+    c.vectors_path = j.at("data").at("vectors").get<std::string>();
+    c.chunks_path  = j.at("data").at("chunks").get<std::string>();
+    return c;
 }
 
-// 可选环境变量（EMBED_API_KEY / LLM_API_KEY）：有则走 Bearer 鉴权，无则放行
-std::string optional_env(const char* name) {
-    const char* v = std::getenv(name);
-    return (v && *v) ? std::string(v) : std::string();
+// 鉴权中间件（Task 15，设计文档第 11 节）：横切面收在包装函数里，三个业务路由
+// 各包一层，路由内部代码零改动。/healthz 与静态页不包鉴权。
+
+// 常数时间比较：逐位异或累计差，无提前返回——防时序攻击
+bool ct_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
+    return diff == 0;
+}
+
+static std::atomic<uint64_t> g_unauthorized{0};
+
+// 缺 token / 错 token 一律 401，不区分原因（不向未授权者泄露信息）
+template <typename F>
+auto with_auth(F handler, const std::string& token) {
+    return [handler, token](const httplib::Request& req, httplib::Response& res) {
+        static const std::string prefix = "Bearer ";
+        auto it = req.headers.find("Authorization");
+        if (it == req.headers.end() || it->second.rfind(prefix, 0) != 0
+            || !ct_equal(it->second.substr(prefix.size()), token)) {
+            ++g_unauthorized;                    // 401 计数（不记 token 内容）
+            LOG_WARN("401 unauthorized, total=%llu",
+                     static_cast<unsigned long long>(g_unauthorized.load()));
+            res.status = 401;
+            return;
+        }
+        handler(req, res);
+    };
 }
 
 // 只读 vectors.bin 16 字节头拿 dim（Engine 构造函数需要）；magic/版本/字节数/条数的
@@ -317,34 +363,31 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 } // namespace
 
 int main() {
-    // ---- 1. 环境变量（PORT 默认 8080；必需变量缺失 fail fast）----
-    int port = 8080;
-    if (const char* p = std::getenv("PORT"); p && *p) {
-        char* end = nullptr;
-        const long v = std::strtol(p, &end, 10);
-        if (!end || *end != '\0' || v <= 0 || v > 65535) {
-            LOG_ERROR("invalid PORT value: %s", p);
-            return 1;
-        }
-        port = static_cast<int>(v);
+    // ---- 1. 配置文件（server_config.json；缺失/字段错即 fail fast）----
+    AppConfig cfg;
+    try {
+        cfg = load_config(kConfigPath);
+    } catch (const std::exception& e) {
+        LOG_ERROR("config load failed: %s", e.what());
+        LOG_ERROR("recovery hint: copy server_config.example.json to server_config.json "
+                  "and fill in real values");
+        return 1;
     }
-    const std::string embed_base = require_env("EMBED_API_BASE");
-    const std::string embed_model = require_env("EMBED_MODEL");
-    const std::string embed_key = optional_env("EMBED_API_KEY");
-    const std::string llm_base = require_env("LLM_API_BASE");
-    const std::string llm_model = require_env("LLM_MODEL");
-    const std::string llm_key = optional_env("LLM_API_KEY");
+    if (cfg.port <= 0 || cfg.port > 65535) {
+        LOG_ERROR("invalid server.port in %s: %d", kConfigPath, cfg.port);
+        return 1;
+    }
 
     // ---- 2. chunks.json 内存副本（下标 = id，供 fetch_chunk / fetch_meta / 结果回填）----
     std::vector<core::ChunkMeta> metas;
     std::vector<std::string> contents;
-    load_chunks(kChunksPath, metas, contents);
+    load_chunks(cfg.chunks_path, metas, contents);
 
     // ---- 3. vectors.bin 头部取 dim → Engine 构造 + load（校验失败即退出）----
-    const uint32_t dim = read_dim_from_header(kVectorsPath);
+    const uint32_t dim = read_dim_from_header(cfg.vectors_path);
     core::Engine engine(dim, core::Engine::Mode::Auto);
     try {
-        engine.load(kVectorsPath, metas);   // magic/版本/维度/字节数/跨文件条数校验都在 Engine 内
+        engine.load(cfg.vectors_path, metas);   // magic/版本/维度/字节数/跨文件条数校验都在 Engine 内
     } catch (const std::exception& e) {
         LOG_ERROR("startup aborted: %s", e.what());
         // 恢复提示：count mismatch 是最常见的数据不一致，指向重建路径
@@ -365,11 +408,12 @@ int main() {
     // 隐含前提 (b)：缓存键只有 query、未含模型/服务配置，当前配置进程级固定所以正确；
     // 未来若支持 per-request 换模型，缓存键需把配置一并纳入。
     std::function<std::vector<float>(const std::string&)> embed_query =
-        [embed_base, embed_key, embed_model](const std::string& q) -> std::vector<float> {
+        [emb_base = cfg.emb_base, emb_key = cfg.emb_key,
+         emb_model = cfg.emb_model](const std::string& q) -> std::vector<float> {
         static thread_local std::string cached_q;
         static thread_local std::vector<float> cached_v;
         if (!cached_v.empty() && cached_q == q) return cached_v;
-        std::vector<float> v = embed_query_once(embed_base, embed_key, embed_model, q);
+        std::vector<float> v = embed_query_once(emb_base, emb_key, emb_model, q);
         if (!v.empty()) {
             cached_q = q;
             cached_v = v;
@@ -379,7 +423,7 @@ int main() {
 
     // ---- 5. Pipeline（engine 声明在前，保证比 pipeline 活得久）----
     rag::Pipeline pipeline(engine,
-        rag::LlmConfig{llm_base, llm_key, llm_model},
+        rag::LlmConfig{cfg.llm_base, cfg.llm_key, cfg.llm_model},
         embed_query,
         [&contents](uint32_t id) -> std::string {
             std::shared_lock lk(g_store_mtx);
@@ -431,8 +475,8 @@ int main() {
         res.set_content(out.dump(), "application/json");
     });
 
-    // POST /search：embed → engine.search → 结果带元数据与原文
-    svr.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
+    // POST /search：embed → engine.search → 结果带元数据与原文（包鉴权）
+    auto search_handler = [&](const httplib::Request& req, httplib::Response& res) {
         if (g_service_broken.load()) {   // 入库中途异常后的不可服务状态（见 g_service_broken）
             send_error(res, 503, "server state inconsistent, restart required");
             return;
@@ -490,10 +534,11 @@ int main() {
             {"top_k_effective", k},
             {"results", std::move(results)}};
         res.set_content(out.dump(), "application/json");
-    });
+    };
+    svr.Post("/search", with_auth(search_handler, cfg.token));
 
-    // POST /ask：embed（失败 502）→ Pipeline::ask（LLM 失败内部降级，仍 200）
-    svr.Post("/ask", [&](const httplib::Request& req, httplib::Response& res) {
+    // POST /ask：embed（失败 502）→ Pipeline::ask（LLM 失败内部降级，仍 200）（包鉴权）
+    auto ask_handler = [&](const httplib::Request& req, httplib::Response& res) {
         if (g_service_broken.load()) {
             send_error(res, 503, "server state inconsistent, restart required");
             return;
@@ -538,10 +583,11 @@ int main() {
             {"llm_ok", r.llm_ok},
             {"citations", std::move(citations)}};
         res.set_content(out.dump(), "application/json");
-    });
+    };
+    svr.Post("/ask", with_auth(ask_handler, cfg.token));
 
-    // POST /documents：收 chunk 包，先整体校验再逐条入库（要么全收要么全拒）
-    svr.Post("/documents", [&](const httplib::Request& req, httplib::Response& res) {
+    // POST /documents：收 chunk 包，先整体校验再逐条入库（要么全收要么全拒）（包鉴权）
+    auto documents_handler = [&](const httplib::Request& req, httplib::Response& res) {
         if (g_service_broken.load()) {
             send_error(res, 503, "server state inconsistent, restart required");
             return;
@@ -659,7 +705,12 @@ int main() {
             {"index", engine.active_index_name()},
             {"index_ready", engine.index_ready()}};
         res.set_content(out.dump(), "application/json");
-    });
+    };
+    svr.Post("/documents", with_auth(documents_handler, cfg.token));
+
+    // 静态页托管（Task 15.4）：GET / 返回 web/index.html；API 路由先注册，httplib
+    // 精确路径优先于挂载点，业务路由不会被静态文件遮蔽
+    svr.set_mount_point("/", "web");
 
     // ---- 7. 监听 + 优雅停机 ----
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
@@ -669,9 +720,9 @@ int main() {
     if (g_shutdown.load()) {
         LOG_INFO("shutdown signal received before listen, exiting gracefully");
     } else {
-        LOG_INFO("course-rag server listening on 127.0.0.1:%d", port);
-        if (!svr.listen("127.0.0.1", port)) {
-            LOG_ERROR("listen failed on 127.0.0.1:%d", port);
+        LOG_INFO("course-rag server listening on 127.0.0.1:%d", cfg.port);
+        if (!svr.listen("127.0.0.1", cfg.port)) {
+            LOG_ERROR("listen failed on 127.0.0.1:%d", cfg.port);
             return 1;
         }
     }
@@ -691,8 +742,8 @@ int main() {
     } else if (engine.dirty()) {    // 只有 /documents 新增过才置脏（load 本身不置脏）
         try {
             // 顺序按计划规定：先原子写 chunks.json，再 persist vectors.bin；任一失败非零码退出
-            atomic_write_chunks(kChunksPath, metas, contents);
-            engine.persist(kVectorsPath);
+            atomic_write_chunks(cfg.chunks_path, metas, contents);
+            engine.persist(cfg.vectors_path);
             LOG_INFO("flushed %zu chunks + vectors to disk", metas.size());
         } catch (const std::exception& e) {
             LOG_ERROR("flush failed: %s", e.what());

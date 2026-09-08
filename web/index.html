@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>课程资料问答</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  input, button { font-size: 16px; padding: 8px; margin: 4px 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  .cite { color: #666; font-size: 14px; margin-top: 8px; border-top: 1px solid #ddd; padding-top: 6px; }
+  .notice { color: #a60; margin-top: 6px; }
+  .error { color: #c00; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h2>课程资料问答</h2>
+<input type="text" id="token" placeholder="访问口令">
+<button onclick="saveToken()">保存口令</button>
+<br>
+<input type="text" id="q" placeholder="例如：死锁的四个必要条件是什么？">
+<button onclick="ask()">提问</button>
+<div id="answer"></div>
+
+<script>
+const saveToken = () => localStorage.setItem('rag_token', document.getElementById('token').value);
+document.getElementById('token').value = localStorage.getItem('rag_token') || '';
+
+async function ask() {
+  const q = document.getElementById('q').value;
+  const answerEl = document.getElementById('answer');
+  answerEl.textContent = '检索中…';
+  try {
+    const r = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+                 'Authorization': 'Bearer ' + localStorage.getItem('rag_token') },
+      body: JSON.stringify({ query: q, top_k: 3 })   // 与服务端 /ask 契约：query + top_k
+    });
+    if (r.status === 401) { answerEl.textContent = '口令错误，请重新输入'; return; }
+    if (r.status === 502) { answerEl.textContent = '检索服务暂时不可用，请稍后重试'; return; }
+    const d = await r.json();
+    if (!r.ok) { answerEl.textContent = d.error || ('请求失败：' + r.status); return; }
+    answerEl.innerHTML = '';
+    const a = document.createElement('div');
+    a.textContent = d.answer;                 // textContent 防 XSS，不用 innerHTML 渲染正文
+    answerEl.appendChild(a);
+    // LLM 行为规范联动：通用知识标注原样呈现并高亮提示
+    if (d.answer && d.answer.includes('【以下为通用知识')) {
+      const n = document.createElement('div');
+      n.className = 'notice';
+      n.textContent = '本回答包含非课程资料的通用知识';
+      answerEl.appendChild(n);
+    }
+    const c = document.createElement('div');
+    c.className = 'cite';
+    c.textContent = '来源：' + (d.citations || []).map(x =>
+      '《' + x.course + '》' + x.title + '（相似度 ' + x.similarity.toFixed(3) + '）').join('；');
+    answerEl.appendChild(c);
+  } catch (e) { answerEl.textContent = '网络错误：' + e; }
+}
+</script>
+</body>
+</html>
