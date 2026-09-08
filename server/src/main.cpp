@@ -59,6 +59,9 @@ std::shared_mutex g_store_mtx;
 
 httplib::Server* g_svr = nullptr;      // 控制台回调里只调 svr.stop()（线程安全）
 std::atomic<bool> g_shutdown{false};
+// 不可服务标志：/documents 入库中途异常会让 engine 与内存副本 id 永久错位（无法就地
+// 修复），置位后三个业务路由一律 503，进程保持存活等待停机，且不再 flush（见停机处）
+std::atomic<bool> g_service_broken{false};
 
 // ---- 启动辅助 ------------------------------------------------------------
 
@@ -168,13 +171,11 @@ void atomic_write_chunks(const std::string& path,
         f.flush();
         if (!f) throw std::runtime_error("write failed: " + tmp);
     }                       // 离开作用域 = 文件确实关闭落盘，之后才替换
-#ifdef _WIN32
+    // Windows-only：MoveFileExA 同卷原子替换已存在目标文件。项目不构建 POSIX 目标
+    // （console handler 等处本就无 _WIN32 守卫），不留 std::rename 的"看似可移植实则
+    // 编译不过"死分支
     if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
         throw std::runtime_error("atomic replace failed: " + path);
-#else
-    if (std::rename(tmp.c_str(), path.c_str()) != 0)
-        throw std::runtime_error("atomic replace failed: " + path);
-#endif
 }
 
 // ---- 请求处理辅助 --------------------------------------------------------
@@ -199,7 +200,8 @@ void send_error(httplib::Response& res, int status, const std::string& msg) {
 bool parse_search_like_body(const httplib::Request& req, httplib::Response& res,
                             std::string& query, long long& top_k) {
     if (req.body.size() > kQueryBodyMax) {
-        send_error(res, 400, "request body exceeds 65536 bytes limit");
+        send_error(res, 400, "request body exceeds " + std::to_string(kQueryBodyMax)
+                               + " bytes limit");
         return false;
     }
     const auto j = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
@@ -289,17 +291,25 @@ std::vector<float> embed_query_once(const std::string& base_url,
 }
 
 // 优雅停机回调：运行在系统分配的独立线程，只做 svr.stop()（线程安全）；
-// flush 链路（wait_rebuild → 写 chunks.json → persist）留在 listen 返回后的主线程
+// flush 链路（wait_rebuild → 写 chunks.json → persist）留在 listen 返回后的主线程。
+// CTRL_CLOSE/LOGOFF/SHUTDOWN 同样只调 stop()：Windows 对这三类事件给约 5s 宽限期
+// 才强杀，主线程在此窗口内完成 flush 后自然退出
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
-    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) {
+    switch (ctrl_type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
         if (!g_shutdown.exchange(true)) {
             LOG_INFO("console ctrl %lu received, stopping accept loop...",
                      static_cast<unsigned long>(ctrl_type));
             if (g_svr) g_svr->stop();
         }
         return TRUE;   // 已处理，屏蔽默认强杀，让主线程走优雅 flush
+    default:
+        return FALSE;
     }
-    return FALSE;
 }
 
 } // namespace
@@ -335,6 +345,9 @@ int main() {
         engine.load(kVectorsPath, metas);   // magic/版本/维度/字节数/跨文件条数校验都在 Engine 内
     } catch (const std::exception& e) {
         LOG_ERROR("startup aborted: %s", e.what());
+        // 恢复提示：count mismatch 是最常见的数据不一致，指向重建路径
+        LOG_ERROR("recovery hint: if this is a count mismatch, re-run tools/embedder.py "
+                  "to rebuild data/, or fix vectors.bin / chunks.json so entry counts match");
         return 1;
     }
     LOG_INFO("engine loaded %zu vectors (dim=%u, index=%s)", engine.size(), dim,
@@ -345,6 +358,10 @@ int main() {
     // 还会再调一次——thread_local 缓存让同一请求内的第二次调用命中缓存，避免对 embedding
     // 服务连发两次。httplib 每连接一线程、单请求全程在同一线程内处理，缓存无竞争。
     // 失败结果不缓存（空向量不命中），下次请求会重试真实服务。
+    // 隐含前提 (a)：命中判定是整串相等，依赖 Pipeline 原样透传同一 query 字符串；未来若
+    // Pipeline 对 query 做 trim/改写，只是退化为多一次网络调用，不影响正确性。
+    // 隐含前提 (b)：缓存键只有 query、未含模型/服务配置，当前配置进程级固定所以正确；
+    // 未来若支持 per-request 换模型，缓存键需把配置一并纳入。
     std::function<std::vector<float>(const std::string&)> embed_query =
         [embed_base, embed_key, embed_model](const std::string& q) -> std::vector<float> {
         static thread_local std::string cached_q;
@@ -391,6 +408,9 @@ int main() {
             if (ep) std::rethrow_exception(ep);
         } catch (const std::exception& e) {
             LOG_ERROR("unhandled exception: %s", e.what());
+        } catch (...) {
+            // 非 std 异常（原始类型 / 第三方库异常）也记一笔，避免静默 terminate 风险
+            LOG_ERROR("unhandled non-std exception");
         }
         send_error(res, 500, "internal error");
     });
@@ -411,14 +431,31 @@ int main() {
 
     // POST /search：embed → engine.search → 结果带元数据与原文
     svr.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
+        if (g_service_broken.load()) {   // 入库中途异常后的不可服务状态（见 g_service_broken）
+            send_error(res, 503, "server state inconsistent, restart required");
+            return;
+        }
         std::string query;
         long long top_k = 0;
         if (!parse_search_like_body(req, res, query, top_k)) return;
 
-        // 超容量 clamp 到当前条数；条数为 0 时 k=0 会触发 BruteIndex 空堆 UB，
-        // 直接返回空结果（不进 engine.search）
+        // 超容量 clamp 到当前条数；空索引时 k=0，直接返回空结果，不进 engine.search
+        // （不依赖 core 的边界语义）
         const size_t k = static_cast<size_t>(
             std::min<long long>(top_k, static_cast<long long>(engine.size())));
+
+        // 空索引：k 必为 0，跳过 embed 直接返回空结果——省一次注定失败的外网调用。
+        // 与 /ask 的语义差异：/ask 必须产出 LLM 答案，对空资料区发起只会白费一次 LLM
+        // 调用故返回 503；/search 空集是合法的"0 命中"，无需外呼即可完整响应
+        if (engine.size() == 0) {
+            nlohmann::json out = {
+                {"index", engine.active_index_name()},
+                {"index_ready", engine.index_ready()},
+                {"top_k_effective", k},
+                {"results", nlohmann::json::array()}};
+            res.set_content(out.dump(), "application/json");
+            return;
+        }
 
         const std::vector<float> qv = embed_query(query);
         if (qv.empty()) {
@@ -455,12 +492,18 @@ int main() {
 
     // POST /ask：embed（失败 502）→ Pipeline::ask（LLM 失败内部降级，仍 200）
     svr.Post("/ask", [&](const httplib::Request& req, httplib::Response& res) {
+        if (g_service_broken.load()) {
+            send_error(res, 503, "server state inconsistent, restart required");
+            return;
+        }
         std::string query;
         long long top_k = 0;
         if (!parse_search_like_body(req, res, query, top_k)) return;
 
+        // 空索引直接 503：问答必须产出 LLM 答案，对空资料区发起只会白费一次 LLM 调用
+        // （/search 空集可无外呼返回 200 空结果，两路由语义不同故处理不同）
         const size_t total = engine.size();
-        if (total == 0) {   // 空索引无法问答，也避开 k=0 的空堆 UB
+        if (total == 0) {
             send_error(res, 503, "index is empty");
             return;
         }
@@ -497,6 +540,10 @@ int main() {
 
     // POST /documents：收 chunk 包，先整体校验再逐条入库（要么全收要么全拒）
     svr.Post("/documents", [&](const httplib::Request& req, httplib::Response& res) {
+        if (g_service_broken.load()) {
+            send_error(res, 503, "server state inconsistent, restart required");
+            return;
+        }
         // 重建窗口禁止写（Engine 契约：load 后台重建期间无写冲突，由本 503 保证）；
         // 拒绝时不得改动内存副本
         if (!engine.index_ready()) {
@@ -555,18 +602,22 @@ int main() {
             }
             std::vector<float> v;
             v.reserve(dim);
-            double n2 = 0.0;
+            // 判零必须与 VectorStore::add 的 float 累加判定（n2 += x*x 后判 n2 == 0.0f）
+            // 逐位一致：若这里用 double 累加，全 1e-30f 这类向量 double 侧非零、float 侧
+            // 为零，会绕过前置校验，在下面锁内 add 循环中途抛 "zero vector rejected"，
+            // 造成 engine 与内存副本 id 永久错位
+            float n2 = 0.0f;
             for (const auto& x : it["vector"]) {
                 if (!x.is_number()) {
                     send_error(res, 400, at + ".vector contains non-number element");
                     return;
                 }
                 const float f = x.get<float>();
-                n2 += static_cast<double>(f) * f;
+                n2 += f * f;
                 v.push_back(f);
             }
             // 零向量前置校验：VectorStore::add 会拒绝零向量，先拦下才能保证"全收或全拒"
-            if (n2 == 0.0) {
+            if (n2 == 0.0f) {
                 send_error(res, 400, at + ".vector is a zero vector");
                 return;
             }
@@ -582,11 +633,23 @@ int main() {
         // 否则并发 /documents 会造成 id 与副本下标错位
         {
             std::unique_lock lk(g_store_mtx);
-            for (size_t i = 0; i < vecs.size(); ++i)
-                engine.add(std::move(vecs[i]), new_metas[i]);
-            metas.insert(metas.end(), new_metas.begin(), new_metas.end());
-            contents.insert(contents.end(), std::make_move_iterator(new_contents.begin()),
-                            std::make_move_iterator(new_contents.end()));
+            try {
+                for (size_t i = 0; i < vecs.size(); ++i)
+                    engine.add(std::move(vecs[i]), new_metas[i]);
+                metas.insert(metas.end(), new_metas.begin(), new_metas.end());
+                contents.insert(contents.end(), std::make_move_iterator(new_contents.begin()),
+                                std::make_move_iterator(new_contents.end()));
+            } catch (const std::exception& e) {
+                // TODO: 批量 add 的原子性根治在 core 侧，超出本任务；这里只能止损——
+                // 中途异常（修完零向量前置校验后现实路径主要是 bad_alloc）意味着部分
+                // 条目已入 engine 而内存副本未追加，两者 id 已永久错位且无法就地修复，
+                // 必须整体停服，靠重启从磁盘一致状态恢复
+                LOG_ERROR("documents add failed mid-batch: %s; engine and in-memory copy "
+                          "are now inconsistent, restart required", e.what());
+                g_service_broken.store(true);
+                send_error(res, 503, "server state inconsistent, restart required");
+                return;
+            }
         }
         LOG_INFO("documents added: %zu (total %zu)", items.size(), engine.size());
         nlohmann::json out = {
@@ -598,16 +661,32 @@ int main() {
 
     // ---- 7. 监听 + 优雅停机 ----
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
-    LOG_INFO("course-rag server listening on 127.0.0.1:%d", port);
-    if (!svr.listen("127.0.0.1", port)) {
-        LOG_ERROR("listen failed on 127.0.0.1:%d", port);
-        return 1;
+    // 关闭"注册 handler 与 listen 之间"的窄窗口竞态：若窗口内已收到停机信号，
+    // 不再进 listen（此刻 stop 已把内部状态置停，再 listen 会重新绑定端口开始服务），
+    // 直接落到下面的 flush 流程——此时必无脏数据，等价空跑一遍优雅停机
+    if (g_shutdown.load()) {
+        LOG_INFO("shutdown signal received before listen, exiting gracefully");
+    } else {
+        LOG_INFO("course-rag server listening on 127.0.0.1:%d", port);
+        if (!svr.listen("127.0.0.1", port)) {
+            LOG_ERROR("listen failed on 127.0.0.1:%d", port);
+            return 1;
+        }
     }
-    // listen 返回 = 已停止接收新请求；flush 在主线程做（回调里绝不 flush）
+    // listen 返回 = 已停止接收新请求；flush 在主线程做（回调里绝不 flush）。
+    // 此刻无锁读 metas/contents 是安全的：httplib 0.15.3 的 listen_internal 在 accept
+    // 循环退出后调 task_queue->shutdown()，其中置停机标志、notify_all 后 join 全部
+    // worker，worker 排空剩余任务才退出——listen 返回后不再有任何 handler 并发访问
+    // 内存副本。勿在此处额外加锁或改动该排空顺序
     LOG_INFO("accept loop stopped, flushing...");
     engine.wait_rebuild();   // 等后台重建结束，避免 persist 与重建线程竞争
 
-    if (engine.dirty()) {    // 只有 /documents 新增过才置脏（load 本身不置脏）
+    if (g_service_broken.load()) {
+        // 不可服务状态下绝不 flush：engine 已含中途入库的部分向量而内存副本没有，
+        // 此时落盘会写出 vectors.bin 与 chunks.json 条数不一致的数据，重启必然
+        // count mismatch 拒载；不 flush 则磁盘保持最后一次一致状态，重启即恢复
+        LOG_ERROR("service broken flag set, skip flush to keep last consistent on-disk state");
+    } else if (engine.dirty()) {    // 只有 /documents 新增过才置脏（load 本身不置脏）
         try {
             // 顺序按计划规定：先原子写 chunks.json，再 persist vectors.bin；任一失败非零码退出
             atomic_write_chunks(kChunksPath, metas, contents);
