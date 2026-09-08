@@ -292,8 +292,10 @@ std::vector<float> embed_query_once(const std::string& base_url,
 
 // 优雅停机回调：运行在系统分配的独立线程，只做 svr.stop()（线程安全）；
 // flush 链路（wait_rebuild → 写 chunks.json → persist）留在 listen 返回后的主线程。
-// CTRL_CLOSE/LOGOFF/SHUTDOWN 同样只调 stop()：Windows 对这三类事件给约 5s 宽限期
-// 才强杀，主线程在此窗口内完成 flush 后自然退出
+// CTRL_CLOSE/LOGOFF/SHUTDOWN 同样只调 stop()：这三类事件 Windows 给的约 5s 宽限期
+// 属于 handler 线程的执行时间，handler 一返回进程即被强杀——本实现 handler 立即返回，
+// 主线程 flush 是与强杀"赛跑"，不保证完成；但 flush 本身事务性（tmp+原子替换），
+// 中途被杀不留半截文件，最坏退化为"本次新增未落盘"，不会写出损坏数据
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     switch (ctrl_type) {
     case CTRL_C_EVENT:
