@@ -1,4 +1,4 @@
-﻿#include <core/engine.hpp>
+#include <core/engine.hpp>
 #include <core/log.hpp>
 #include <core/vector_store.hpp>
 #include <mutex>
@@ -96,6 +96,10 @@ void Engine::load(const std::string& vectors_path,
         rebuild_thread_ = std::thread([this, snap = std::move(loaded), metas] {
             try {
                 auto ni = std::make_unique<HnswIndex>(dim_, /*M=*/16, /*efC=*/200);   // 独立新实例，不碰在线索引
+                // 默认 efS=16 在 10 万×1024 合成数据上召回仅 0.568（benchmark 首跑实测），
+                // 定档 efS=128：召回 0.978（P99 3.8ms / QPS 397），满足 95% 关卡的最低档；
+                // 完整曲线见 docs/benchmark.md（16→0.568 / 64→0.908 / 128→0.978 / 256→0.997）
+                ni->set_ef_search(128);
                 for (size_t i = 0; i < snap.size(); ++i) ni->add(snap.get(i), metas[i]);
                 {
                     std::unique_lock lk(mtx_);
