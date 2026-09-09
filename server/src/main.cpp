@@ -12,8 +12,9 @@
 // 优雅停机：控制台回调（独立线程）只调 svr.stop() 停止接收新请求；listen 返回后主线程
 // wait_rebuild → dirty 时先原子写 chunks.json 再 persist vectors.bin。回调里绝不做 flush。
 //
-// v1 限制（与 rag/src/pipeline.cpp 的 call_llm 一致）：未定义 CPPHTTPLIB_OPENSSL_SUPPORT，
-// httplib 只能发 http，https 端点会连接失败走 502；TLS 策略留给 Task 16。
+// v1 限制已解除（Task 16 前置）：CMake 探测到 third_party/openssl 时定义
+// CPPHTTPLIB_OPENSSL_SUPPORT，httplib 客户端可调 https 的 embedding/LLM API
+// （仅出站客户端；入站 TLS 由公网隧道层终结，server 本体继续只说 HTTP）。
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

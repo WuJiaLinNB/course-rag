@@ -1,4 +1,4 @@
-﻿#include <rag/pipeline.hpp>
+#include <rag/pipeline.hpp>
 #include <httplib.h>
 #include <json.hpp>   // nlohmann/json v3.11.3 单头（Task 12.1 的下载项提前到位，rag 先复用）
 #include <core/log.hpp>
@@ -56,9 +56,9 @@ std::string Pipeline::build_prompt_(const std::string& question,
 
 // OpenAI 兼容 /chat/completions。失败一律返回 ""（上层统一走降级文案），绝不抛异常。
 //
-// v1 限制：本工程未定义 CPPHTTPLIB_OPENSSL_SUPPORT（VS2019 + OpenSSL 依赖过重），
-// httplib 只能发 http 请求，https 端点会连接失败 → 走降级路径。TLS 策略留给
-// Task 15/16 部署时定（frp 隧道场景 server 是 http）。
+// TLS（Task 16 前置）：Windows 构建由 CMake 定义 CPPHTTPLIB_OPENSSL_SUPPORT
+// （vendored OpenSSL），https 端点可直连；未定义时（CI/旧配置）https 会连接失败
+// 走降级路径。仅出站客户端——入站 TLS 由公网隧道层终结（设计文档第 14 节）。
 //
 // 超时策略（见头文件自测 3）：连接 5s（与 server 层在线 embedding 查询同款）、
 // 读 30s、失败不重试直接降级——重试叠加秒级超时会拖垮调用线程。

@@ -1,0 +1,18 @@
+OpenSSL 3.6.4 (x64-windows, MSVC)
+==================================
+来源：由 vcpkg 编译（D:\AICode\aixiangmu\vcpkg），triplet=x64-windows
+      vcpkg commit 对应 openssl port 3.6.4（含 vcpkg 官方补丁集）。
+      GitHub 直连不稳定，源码包经 ghproxy.net 镜像下载（SHA512 已在 vcpkg portfile 中 pin）。
+
+布局：
+  include/  OpenSSL 公开头文件
+  lib/      libssl.lib、libcrypto.lib（MSVC import lib，链 DLL 版）
+  bin/      libssl-3-x64.dll、libcrypto-3-x64.dll、legacy.dll（运行时必需）
+
+用途（出站 TLS）：仅用于 cpp-httplib 客户端调 https 的 embedding/LLM API
+（CMake 定义 CPPHTTPLIB_OPENSSL_SUPPORT）。入站 TLS 由公网隧道层终结，server 本体仍为纯 HTTP。
+
+重新构建（如需升级/重建）：
+  vcpkg.exe install openssl:x64-windows --x-install-root=...
+  # 依赖（先入 vcpkg downloads 缓存）：ninja、cmake、7zip、powershell-core、
+  # strawberry-perl、nasm、jom（GitHub/Qt 官方源均不稳定，需镜像或代理）。
