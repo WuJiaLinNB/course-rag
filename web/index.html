@@ -2,14 +2,37 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>课程资料问答</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
-  input, button { font-size: 16px; padding: 8px; margin: 4px 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1f2328; line-height: 1.6; }
+  input, button { font-size: 16px; padding: 8px 12px; margin: 4px 0; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
   input[type=text] { width: 100%; box-sizing: border-box; }
-  .cite { color: #666; font-size: 14px; margin-top: 8px; border-top: 1px solid #ddd; padding-top: 6px; }
-  .notice { color: #a60; margin-top: 6px; }
+  button { cursor: pointer; }
+  button:hover { background: #f6f8fa; }
+  .notice { color: #9a6700; background: #fff8c5; padding: 6px 10px; border-radius: 6px; margin-top: 8px; }
   .error { color: #c00; margin-top: 6px; }
+  /* ---- Markdown 渲染样式（白名单标签） ---- */
+  .md h1, .md h2, .md h3, .md h4 { margin: 14px 0 6px; line-height: 1.3; }
+  .md h1 { font-size: 1.5em; } .md h2 { font-size: 1.3em; } .md h3 { font-size: 1.15em; } .md h4 { font-size: 1em; }
+  .md p { margin: 8px 0; }
+  .md ul { margin: 8px 0; padding-left: 22px; }
+  .md li { margin: 3px 0; }
+  .md code { background: #f0f1f2; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  .md pre { background: #f6f8fa; padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { border-left: 3px solid #d0d7de; margin: 8px 0; padding-left: 12px; color: #57606a; }
+  .md a { color: #0969da; }
+  /* ---- 引用卡片 ---- */
+  .cite { margin-top: 14px; border-top: 1px solid #d8dee4; padding-top: 8px; }
+  .cite-title { font-size: 14px; font-weight: 600; }
+  .cite-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .cite-bar { flex: 1; height: 6px; background: #eaeef2; border-radius: 3px; overflow: hidden; }
+  .cite-fill { height: 100%; background: #0969da; border-radius: 3px; }
+  .cite-sim { font-size: 12px; color: #57606a; min-width: 38px; text-align: right; }
+  .cite-card { border: 1px solid #d8dee4; border-radius: 6px; padding: 8px 10px; margin-top: 8px; background: #fff; }
+  .cite-btn { font-size: 13px; padding: 3px 10px; margin-top: 6px; }
+  .cite-body { margin-top: 8px; padding: 8px 10px; background: #f6f8fa; border-radius: 6px; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -22,13 +45,65 @@
 <div id="answer"></div>
 
 <script>
+// ================= 安全 Markdown 渲染 =================
+// 原则：所有原始文本先 HTML 转义，仅生成白名单标签（strong/em/code/pre/ul/li/h*/blockquote/a）。
+// 不用任何第三方库、不引入 CDN；链接仅放行 http(s)，杜绝 javascript: 注入。
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function inlineMd(s) {
+  let t = esc(s);
+  t = t.replace(/`([^`]+)`/g, (m, p) => '<code>' + p + '</code>');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return t;
+}
+function renderMd(src) {
+  const blocks = [];
+  let s = src.replace(/```([\s\S]*?)```/g, (m, code) => {
+    blocks.push('<pre><code>' + esc(code) + '</code></pre>');
+    return '\u0000B' + (blocks.length - 1) + '\u0000';
+  });
+  const lines = s.split('\n');
+  let html = '', inList = false;
+  const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+  for (const raw of lines) {
+    const t = raw.trim();
+    if (!t) { closeList(); continue; }
+    if (/^#{1,4}\s/.test(t)) { closeList(); const n = t.indexOf(' '); html += '<h' + n + '>' + inlineMd(t.slice(n + 1)) + '</h' + n + '>'; continue; }
+    if (/^[-*]\s+/.test(t)) { if (!inList) { html += '<ul>'; inList = true; } html += '<li>' + inlineMd(t.replace(/^[-*]\s+/, '')) + '</li>'; continue; }
+    if (/^>\s?/.test(t)) { closeList(); html += '<blockquote>' + inlineMd(t.replace(/^>\s?/, '')) + '</blockquote>'; continue; }
+    closeList(); html += '<p>' + inlineMd(t) + '</p>';
+  }
+  closeList();
+  return html.replace(/\u0000B(\d+)\u0000/g, (m, i) => blocks[i]);
+}
+
+// ================= 交互 =================
 const saveToken = () => localStorage.setItem('rag_token', document.getElementById('token').value);
 document.getElementById('token').value = localStorage.getItem('rag_token') || '';
+document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
+
+async function fetchChunk(id, btn, body) {
+  if (body.dataset.loaded) return;                      // 已加载不重复请求
+  body.textContent = '加载中…';
+  try {
+    const r = await fetch('/chunk?id=' + id, { headers: { 'Authorization': 'Bearer ' + localStorage.getItem('rag_token') } });
+    if (r.status === 401) { body.textContent = '口令已失效，请重新保存口令'; return; }
+    if (r.status === 404) { body.textContent = '原文不存在（id=' + id + '）'; return; }
+    if (!r.ok) { body.textContent = '加载失败：' + r.status; return; }
+    const d = await r.json();
+    body.innerHTML = renderMd(d.content);               // 原文走同一安全渲染器
+    body.dataset.loaded = '1';
+  } catch (e) { body.textContent = '网络错误：' + e; }
+}
 
 async function ask() {
   const q = document.getElementById('q').value;
   const answerEl = document.getElementById('answer');
-  answerEl.textContent = '检索中…';
+  answerEl.innerHTML = '<p>检索中…</p>';
   try {
     const r = await fetch('/ask', {
       method: 'POST',
@@ -40,10 +115,13 @@ async function ask() {
     if (r.status === 502) { answerEl.textContent = '检索服务暂时不可用，请稍后重试'; return; }
     const d = await r.json();
     if (!r.ok) { answerEl.textContent = d.error || ('请求失败：' + r.status); return; }
+
     answerEl.innerHTML = '';
-    const a = document.createElement('div');
-    a.textContent = d.answer;                 // textContent 防 XSS，不用 innerHTML 渲染正文
-    answerEl.appendChild(a);
+    const md = document.createElement('div');
+    md.className = 'md';
+    md.innerHTML = renderMd(d.answer);                // 渲染器输出白名单标签，见 renderMd 注释
+    answerEl.appendChild(md);
+
     // LLM 行为规范联动：通用知识标注原样呈现并高亮提示
     if (d.answer && d.answer.includes('【以下为通用知识')) {
       const n = document.createElement('div');
@@ -51,10 +129,31 @@ async function ask() {
       n.textContent = '本回答包含非课程资料的通用知识';
       answerEl.appendChild(n);
     }
+
+    // 引用卡片：title + 相似度进度条 + 点击懒加载原文（GET /chunk?id=）
     const c = document.createElement('div');
     c.className = 'cite';
-    c.textContent = '来源：' + (d.citations || []).map(x =>
-      '《' + x.course + '》' + x.title + '（相似度 ' + x.similarity.toFixed(3) + '）').join('；');
+    (d.citations || []).forEach(ci => {
+      const card = document.createElement('div'); card.className = 'cite-card';
+      const h = document.createElement('div'); h.className = 'cite-title';
+      h.textContent = '《' + ci.course + '》' + (ci.title || '');
+      const row = document.createElement('div'); row.className = 'cite-row';
+      const bar = document.createElement('div'); bar.className = 'cite-bar';
+      const fill = document.createElement('div'); fill.className = 'cite-fill';
+      fill.style.width = Math.max(0, Math.min(1, ci.similarity)) * 100 + '%';
+      bar.appendChild(fill);
+      const sim = document.createElement('span'); sim.className = 'cite-sim';
+      sim.textContent = ci.similarity.toFixed(3);
+      row.appendChild(bar); row.appendChild(sim);
+      const btn = document.createElement('button'); btn.className = 'cite-btn'; btn.textContent = '查看原文';
+      const body = document.createElement('div'); body.className = 'cite-body'; body.hidden = true;
+      btn.onclick = () => {
+        if (body.hidden) { body.hidden = false; btn.textContent = '收起原文'; fetchChunk(ci.id, btn, body); }
+        else { body.hidden = true; btn.textContent = '查看原文'; }
+      };
+      card.appendChild(h); card.appendChild(row); card.appendChild(btn); card.appendChild(body);
+      c.appendChild(card);
+    });
     answerEl.appendChild(c);
   } catch (e) { answerEl.textContent = '网络错误：' + e; }
 }

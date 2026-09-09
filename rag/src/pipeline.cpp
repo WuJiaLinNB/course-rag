@@ -22,7 +22,7 @@ AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
     citations.reserve(hits.size());
     for (const auto& h : hits) {
         const core::ChunkMeta m = fetch_meta_(h.id);   // 元数据按 id 回查（server 层内存副本）
-        citations.push_back({m.course, m.semester, m.type_, m.title, h.similarity});
+        citations.push_back({h.id, m.course, m.semester, m.type_, m.title, h.similarity});
     }
 
     const std::string answer = call_llm(build_prompt_(question, hits));

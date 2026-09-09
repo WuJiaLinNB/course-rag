@@ -20,8 +20,10 @@ inline std::pair<std::string, std::string> split_base_url(const std::string& bas
     return {base_url.substr(0, slash), base_url.substr(slash)};
 }
 
-// 一条引用（出处卡片）：检索命中的元数据 + 相似度，随答案一起展示给用户
+// 一条引用（出处卡片）：检索命中的向量 id + 元数据 + 相似度，随答案一起展示给用户。
+// id 供上层按需回查原文（server 层 GET /chunk?id=），引用本身不携带正文。
 struct Citation {
+    uint32_t id;
     std::string course, semester, type_, title;
     float similarity;
 };

@@ -577,6 +577,7 @@ int main() {
         nlohmann::json citations = nlohmann::json::array();
         for (const auto& c : r.citations) {
             citations.push_back({
+                {"id", c.id},
                 {"course", c.course},
                 {"semester", c.semester},
                 {"type", c.type_},
@@ -590,6 +591,41 @@ int main() {
         res.set_content(out.dump(), "application/json");
     };
     svr.Post("/ask", with_auth(ask_handler, cfg.token));
+
+    // GET /chunk?id=N：按向量 id 取原文 + 元数据（引用卡片懒加载用）（包鉴权）。
+    // id 来自 /ask 返回的 citations[].id；原文含任意文本，经 JSON 序列化返回，
+    // 前端必须 textContent/转义渲染，禁止 innerHTML 直接拼接（XSS 约束）。
+    auto chunk_handler = [&](const httplib::Request& req, httplib::Response& res) {
+        auto it = req.params.find("id");
+        if (it == req.params.end()) {
+            send_error(res, 400, "missing id");
+            return;
+        }
+        uint32_t id = 0;
+        try {
+            const unsigned long v = std::stoul(it->second);
+            if (v > std::numeric_limits<uint32_t>::max()) throw std::out_of_range("id overflow");
+            id = static_cast<uint32_t>(v);
+        } catch (...) {
+            send_error(res, 400, "invalid id");
+            return;
+        }
+        std::shared_lock lk(g_store_mtx);
+        if (id >= contents.size()) {
+            send_error(res, 404, "chunk not found");
+            return;
+        }
+        const auto& m = metas[id];
+        nlohmann::json out = {
+            {"id", id},
+            {"course", m.course},
+            {"semester", m.semester},
+            {"type", m.type_},
+            {"title", m.title},
+            {"content", contents[id]}};
+        res.set_content(out.dump(), "application/json");
+    };
+    svr.Get("/chunk", with_auth(chunk_handler, cfg.token));
 
     // POST /documents：收 chunk 包，先整体校验再逐条入库（要么全收要么全拒）（包鉴权）
     auto documents_handler = [&](const httplib::Request& req, httplib::Response& res) {
