@@ -28,10 +28,19 @@ struct Citation {
     float similarity;
 };
 
+// 一次检索的白盒信息（Trace 视图）：把"这次回答是怎么检索的"暴露给上层展示，
+// 让索引行为可观测——命中 hnsw/brute、向量规模、单次 top-k 检索耗时。
+struct SearchTrace {
+    std::string index;    // brute / ivf / hnsw（engine.active_index_name() 实际服务索引）
+    size_t n_vectors;     // 引擎当前向量规模
+    double search_ms;     // engine.search 耗时（毫秒，仅该次 top-k 检索，不含 embedding/LLM）
+};
+
 struct AskResult {
     std::string answer;
     std::vector<Citation> citations;
     bool llm_ok;                     // false = LLM 失败，answer 是降级文案
+    SearchTrace trace;               // 检索白盒信息，供上层 Trace 视图展示
 };
 
 struct LlmConfig {

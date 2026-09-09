@@ -33,6 +33,9 @@
   .cite-card { border: 1px solid #d8dee4; border-radius: 6px; padding: 8px 10px; margin-top: 8px; background: #fff; }
   .cite-btn { font-size: 13px; padding: 3px 10px; margin-top: 6px; }
   .cite-body { margin-top: 8px; padding: 8px 10px; background: #f6f8fa; border-radius: 6px; font-size: 14px; }
+  /* ---- 检索 Trace 视图 ---- */
+  .trace { margin-top: 12px; font-size: 13px; color: #57606a; border-top: 1px dashed #d8dee4; padding-top: 6px; }
+  .trace summary { cursor: pointer; user-select: none; }
 </style>
 </head>
 <body>
@@ -128,6 +131,18 @@ async function ask() {
       n.className = 'notice';
       n.textContent = '本回答包含非课程资料的通用知识';
       answerEl.appendChild(n);
+    }
+
+    // 检索 Trace 视图：白盒展示"这次回答怎么检索的"——索引类型/向量规模/检索耗时/命中数
+    if (d.trace) {
+      const t = document.createElement('details'); t.className = 'trace';
+      const s = document.createElement('summary'); s.textContent = '检索详情（trace）';
+      const info = document.createElement('div');
+      info.textContent = '索引：' + d.trace.index + ' · 向量规模：' + d.trace.n_vectors +
+        ' · 检索耗时：' + (d.trace.search_ms || 0).toFixed(2) + ' ms · 命中 ' +
+        (d.citations || []).length + ' 条';
+      t.appendChild(s); t.appendChild(info);
+      answerEl.appendChild(t);
     }
 
     // 引用卡片：title + 相似度进度条 + 点击懒加载原文（GET /chunk?id=）

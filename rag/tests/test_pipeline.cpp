@@ -89,6 +89,9 @@ TEST(Pipeline, CitationsMatchHits) {
     const auto hits = f.engine.search(f.query_e0(), 2, {});
     const auto r = p.ask("什么是进程？", 2);
     ASSERT_EQ(r.citations.size(), hits.size());
+    EXPECT_FALSE(r.trace.index.empty());            // Trace：索引名非空（brute/ivf/hnsw 之一）
+    EXPECT_EQ(r.trace.n_vectors, f.engine.size());  // Trace：向量规模与引擎一致
+    EXPECT_GE(r.trace.search_ms, 0.0);              // Trace：耗时非负
     for (size_t i = 0; i < hits.size(); ++i) {
         const auto& m = f.meta_of(hits[i].id);  // 同一查询两次结果逐位一致（double 累加器 + tie 按 id）
         EXPECT_EQ(r.citations[i].id, hits[i].id);      // 引用携带向量 id，供上层回查原文

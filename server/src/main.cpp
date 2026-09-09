@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -519,8 +520,12 @@ int main() {
         }
 
         nlohmann::json results = nlohmann::json::array();
+        double search_ms = 0.0;
         if (k > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
             const auto hits = engine.search(qv, k, {});   // v1：不做元数据过滤
+            search_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
             std::shared_lock lk(g_store_mtx);
             for (const auto& h : hits) {
                 results.push_back({
@@ -537,6 +542,8 @@ int main() {
             {"index", engine.active_index_name()},
             {"index_ready", engine.index_ready()},
             {"top_k_effective", k},
+            {"n_vectors", engine.size()},
+            {"search_ms", search_ms},
             {"results", std::move(results)}};
         res.set_content(out.dump(), "application/json");
     };
@@ -587,7 +594,10 @@ int main() {
         nlohmann::json out = {
             {"answer", r.answer},
             {"llm_ok", r.llm_ok},
-            {"citations", std::move(citations)}};
+            {"citations", std::move(citations)},
+            {"trace", {{"index", r.trace.index},
+                       {"n_vectors", r.trace.n_vectors},
+                       {"search_ms", r.trace.search_ms}}}};
         res.set_content(out.dump(), "application/json");
     };
     svr.Post("/ask", with_auth(ask_handler, cfg.token));

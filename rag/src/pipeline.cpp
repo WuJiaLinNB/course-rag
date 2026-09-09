@@ -2,6 +2,7 @@
 #include <httplib.h>
 #include <json.hpp>   // nlohmann/json v3.11.3 单头（Task 12.1 的下载项提前到位，rag 先复用）
 #include <core/log.hpp>
+#include <chrono>
 
 namespace rag {
 
@@ -17,7 +18,11 @@ Pipeline::Pipeline(core::Engine& engine, LlmConfig cfg,
 AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
     // 检索先行：无论 LLM 成败，检索命中都要组装成 citations 返回（见头文件自测 1）
     const auto qv = embed_query_(question);
+    const auto t0 = std::chrono::steady_clock::now();
     const auto hits = engine_.search(qv, top_k, {});   // v1：不做元数据过滤
+    const double search_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const SearchTrace trace{engine_.active_index_name(), engine_.size(), search_ms};
     std::vector<Citation> citations;
     citations.reserve(hits.size());
     for (const auto& h : hits) {
@@ -28,9 +33,10 @@ AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
     const std::string answer = call_llm(build_prompt_(question, hits));
     if (answer.empty()) {
         // LLM 失败 → 固定降级文案 + 保留 citations；llm_ok=false 让上层能区分降级与正常回答
-        return {"AI 服务暂不可用，以下为检索到的原文片段", std::move(citations), false};
+        return {"AI 服务暂不可用，以下为检索到的原文片段", std::move(citations), false,
+                std::move(trace)};
     }
-    return {answer, std::move(citations), true};
+    return {answer, std::move(citations), true, std::move(trace)};
 }
 
 // 行为规则三条逐字使用——改一个字都可能破坏约束效果，不要"顺手润色"。
