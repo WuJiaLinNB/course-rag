@@ -102,3 +102,48 @@ TEST(Pipeline, CitationsMatchHits) {
         EXPECT_FLOAT_EQ(r.citations[i].similarity, hits[i].similarity);
     }
 }
+
+// 流式问答·未注入流式 LLM → 降级：meta 仍回传检索结果，done(false)，无 delta
+TEST(Pipeline, AskStreamWithoutLlmStreamDegrades) {
+    Fixture f;
+    Pipeline p = make_pipeline(f);       // make_pipeline 不注入 llm_stream
+    bool meta_called = false, done_called = false;
+    std::vector<std::string> deltas;
+    p.ask_stream("什么是进程？", 2,
+        [&](const AskResult& m) {
+            meta_called = true;
+            EXPECT_FALSE(m.citations.empty());   // 检索结果照常可用
+            EXPECT_FALSE(m.trace.index.empty());
+            return true;
+        },
+        [&](const std::string& t) { deltas.push_back(t); return true; },
+        [&](bool ok) { done_called = true; EXPECT_FALSE(ok); });
+    EXPECT_TRUE(meta_called);
+    EXPECT_TRUE(done_called);
+    EXPECT_TRUE(deltas.empty());         // 无流式出口 → 无增量文本
+}
+
+// 流式问答·注入 mock 流式 LLM：delta 逐块透传、on_done(true)，on_delta 拒绝可中断
+TEST(Pipeline, AskStreamWithInjectedLlmStreamFlows) {
+    Fixture f;
+    std::vector<std::string> seen_prompts;
+    Pipeline p(f.engine, {"http://127.0.0.1:1", "sk-test", "test-model"},
+               [&f](const std::string&) { return f.query_e0(); },
+               [&f](uint32_t id) { return f.chunk_of(id); },
+               [&f](uint32_t id) { return f.meta_of(id); },
+               [&](const std::string& prompt,
+                   const std::function<bool(const std::string&)>& on_delta) -> bool {
+                   seen_prompts.push_back(prompt);
+                   return on_delta("一") && on_delta("二");
+               });
+    std::string joined;
+    bool ok = false;
+    p.ask_stream("什么是进程？", 2,
+        [](const AskResult&) { return true; },
+        [&](const std::string& t) { joined += t; return true; },
+        [&](bool o) { ok = o; });
+    EXPECT_EQ(joined, "一二");           // 增量文本按序到达
+    EXPECT_TRUE(ok);                     // 流完整成功 → on_done(true)
+    ASSERT_EQ(seen_prompts.size(), 1u);
+    EXPECT_NE(seen_prompts[0].find("什么是进程？"), std::string::npos);  // prompt 含问题
+}

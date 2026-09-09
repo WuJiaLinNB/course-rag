@@ -9,11 +9,13 @@ namespace rag {
 Pipeline::Pipeline(core::Engine& engine, LlmConfig cfg,
                    std::function<std::vector<float>(const std::string&)> embed_query,
                    std::function<std::string(uint32_t id)> fetch_chunk,
-                   std::function<core::ChunkMeta(uint32_t id)> fetch_meta)
+                   std::function<core::ChunkMeta(uint32_t id)> fetch_meta,
+                   LlmStreamFn llm_stream)
     : engine_(engine), llm_(std::move(cfg)),
       embed_query_(std::move(embed_query)),
       fetch_chunk_(std::move(fetch_chunk)),
-      fetch_meta_(std::move(fetch_meta)) {}
+      fetch_meta_(std::move(fetch_meta)),
+      llm_stream_(std::move(llm_stream)) {}
 
 AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
     // 检索先行：无论 LLM 成败，检索命中都要组装成 citations 返回（见头文件自测 1）
@@ -37,6 +39,45 @@ AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
                 std::move(trace)};
     }
     return {answer, std::move(citations), true, std::move(trace)};
+}
+
+void Pipeline::ask_stream(const std::string& question, size_t top_k,
+                          const std::function<bool(const AskResult&)>& on_meta,
+                          const std::function<bool(const std::string&)>& on_delta,
+                          const std::function<void(bool)>& on_done) const {
+    // 检索与 ask() 完全同构：先同步完成检索（快，亚毫秒~毫秒级），
+    // on_meta 一次性回传 citations + trace；随后才进入慢的 LLM 阶段。
+    // 这样上层可以先渲染引用/进度，再流式出答案，避免首字等待。
+    const auto qv = embed_query_(question);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto hits = engine_.search(qv, top_k, {});   // v1：不做元数据过滤
+    const double search_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const SearchTrace trace{engine_.active_index_name(), engine_.size(), search_ms};
+    std::vector<Citation> citations;
+    citations.reserve(hits.size());
+    for (const auto& h : hits) {
+        const core::ChunkMeta m = fetch_meta_(h.id);
+        citations.push_back({h.id, m.course, m.semester, m.type_, m.title, h.similarity});
+    }
+    AskResult meta;
+    meta.answer.clear();
+    meta.llm_ok = false;
+    meta.citations = std::move(citations);
+    meta.trace = trace;
+    if (!on_meta(meta)) return;                 // 上层拒绝继续（客户端已断开）
+
+    // 流式 LLM 阶段：llm_stream_ 未注入（如测试/无流式配置）→ 走降级。
+    // on_delta 返回 false = 客户端断开，立即终止，不再调 on_done（连接已死，写了也没人收）。
+    if (!llm_stream_) { on_done(false); return; }
+    const bool ok = llm_stream_(build_prompt_(question, hits), on_delta);
+    if (ok) {
+        on_done(true);
+    } else {
+        // 流中断/LLM 失败：调用方据此展示降级文案（与 ask() 的 llm_ok=false 语义一致）
+        LOG_WARN("ask_stream: llm stream failed");
+        on_done(false);
+    }
 }
 
 // 行为规则三条逐字使用——改一个字都可能破坏约束效果，不要"顺手润色"。

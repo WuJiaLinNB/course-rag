@@ -25,7 +25,8 @@
   .md a { color: #0969da; }
   /* ---- 引用卡片 ---- */
   .cite { margin-top: 14px; border-top: 1px solid #d8dee4; padding-top: 8px; }
-  .cite-title { font-size: 14px; font-weight: 600; }
+  .cite-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .cite-name { font-size: 14px; font-weight: 600; }
   .cite-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
   .cite-bar { flex: 1; height: 6px; background: #eaeef2; border-radius: 3px; overflow: hidden; }
   .cite-fill { height: 100%; background: #0969da; border-radius: 3px; }
@@ -103,74 +104,132 @@ async function fetchChunk(id, btn, body) {
   } catch (e) { body.textContent = '网络错误：' + e; }
 }
 
+// 检索 Trace 视图：白盒展示"这次回答怎么检索的"（索引类型/向量规模/检索耗时）
+function renderTrace(trace, wrap) {
+  const t = document.createElement('details'); t.className = 'trace';
+  const s = document.createElement('summary'); s.textContent = '检索详情（trace）';
+  const info = document.createElement('div');
+  info.textContent = '索引：' + trace.index + ' · 向量规模：' + trace.n_vectors +
+    ' · 检索耗时：' + (trace.search_ms || 0).toFixed(2) + ' ms';
+  t.appendChild(s); t.appendChild(info);
+  wrap.appendChild(t);
+}
+
+// 引用卡片：title + 相似度进度条 + 点击懒加载原文（GET /chunk?id=）
+function renderCites(citations, wrap) {
+  if (!citations || !citations.length) return;
+  const title = document.createElement('div');
+  title.className = 'cite-title';
+  title.textContent = '引用（' + citations.length + '）';
+  wrap.appendChild(title);
+  citations.forEach(ci => {
+    const card = document.createElement('div'); card.className = 'cite-card';
+    const h = document.createElement('div'); h.className = 'cite-name';
+    h.textContent = '《' + ci.course + '》' + (ci.title || '');
+    const row = document.createElement('div'); row.className = 'cite-row';
+    const bar = document.createElement('div'); bar.className = 'cite-bar';
+    const fill = document.createElement('div'); fill.className = 'cite-fill';
+    fill.style.width = Math.max(0, Math.min(1, ci.similarity)) * 100 + '%';
+    bar.appendChild(fill);
+    const sim = document.createElement('span'); sim.className = 'cite-sim';
+    sim.textContent = ci.similarity.toFixed(3);
+    row.appendChild(bar); row.appendChild(sim);
+    const btn = document.createElement('button'); btn.className = 'cite-btn'; btn.textContent = '查看原文';
+    const body = document.createElement('div'); body.className = 'cite-body'; body.hidden = true;
+    btn.onclick = () => {
+      if (body.hidden) { body.hidden = false; btn.textContent = '收起原文'; fetchChunk(ci.id, btn, body); }
+      else { body.hidden = true; btn.textContent = '查看原文'; }
+    };
+    card.appendChild(h); card.appendChild(row); card.appendChild(btn); card.appendChild(body);
+    wrap.appendChild(card);
+  });
+}
+
+// 提问：SSE 流式（/ask/stream）。事件序 meta(引用+trace) → delta(增量文本) → done(llm_ok)
 async function ask() {
   const q = document.getElementById('q').value;
   const answerEl = document.getElementById('answer');
   answerEl.innerHTML = '<p>检索中…</p>';
+  let resp;
   try {
-    const r = await fetch('/ask', {
+    resp = await fetch('/ask/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json',
                  'Authorization': 'Bearer ' + localStorage.getItem('rag_token') },
-      body: JSON.stringify({ query: q, top_k: 3 })   // 与服务端 /ask 契约：query + top_k
+      body: JSON.stringify({ query: q, top_k: 3 })   // 与服务端契约：query + top_k
     });
-    if (r.status === 401) { answerEl.textContent = '口令错误，请重新输入'; return; }
-    if (r.status === 502) { answerEl.textContent = '检索服务暂时不可用，请稍后重试'; return; }
-    const d = await r.json();
-    if (!r.ok) { answerEl.textContent = d.error || ('请求失败：' + r.status); return; }
+  } catch (e) { answerEl.textContent = '网络错误：' + e; return; }
+  if (resp.status === 401) { answerEl.textContent = '口令错误，请重新输入'; return; }
+  if (resp.status === 502) { answerEl.textContent = '检索服务暂时不可用，请稍后重试'; return; }
+  if (resp.status === 503) { answerEl.textContent = '知识库为空，暂无法回答'; return; }
+  if (!resp.ok || !resp.body) { answerEl.textContent = '请求失败：' + resp.status; return; }
 
-    answerEl.innerHTML = '';
-    const md = document.createElement('div');
-    md.className = 'md';
-    md.innerHTML = renderMd(d.answer);                // 渲染器输出白名单标签，见 renderMd 注释
-    answerEl.appendChild(md);
+  // 回答区固定两个容器：答案在上、引用在下，meta 先到也不影响 DOM 顺序
+  answerEl.innerHTML = '';
+  const mdWrap = document.createElement('div'); mdWrap.className = 'md';
+  const citeWrap = document.createElement('div'); citeWrap.className = 'cite';
+  answerEl.appendChild(mdWrap); answerEl.appendChild(citeWrap);
 
-    // LLM 行为规范联动：通用知识标注原样呈现并高亮提示
-    if (d.answer && d.answer.includes('【以下为通用知识')) {
-      const n = document.createElement('div');
-      n.className = 'notice';
-      n.textContent = '本回答包含非课程资料的通用知识';
-      answerEl.appendChild(n);
+  let buf = '', answerText = '', metaSeen = false, doneSeen = false;
+  const handle = (name, dataStr) => {
+    if (!dataStr) return;
+    if (name === 'meta' && !metaSeen) {
+      metaSeen = true;
+      try {
+        const d = JSON.parse(dataStr);
+        if (d.trace) renderTrace(d.trace, citeWrap);
+        renderCites(d.citations || [], citeWrap);
+      } catch (e) { /* 单帧解析失败跳过 */ }
+    } else if (name === 'delta') {
+      try {
+        const d = JSON.parse(dataStr);
+        if (d.text) { answerText += d.text; mdWrap.innerHTML = renderMd(answerText); }
+      } catch (e) { /* 同上 */ }
+    } else if (name === 'done' && !doneSeen) {
+      doneSeen = true;
+      try {
+        const d = JSON.parse(dataStr);
+        if (d.llm_ok === false) {
+          if (!answerText) { mdWrap.textContent = 'AI 服务暂不可用，以下为检索到的原文片段'; }
+          else {
+            const n = document.createElement('div'); n.className = 'notice';
+            n.textContent = 'AI 服务中断，以上为不完整回答（可查看下方引用原文）';
+            mdWrap.appendChild(n);
+          }
+        } else if (answerText.includes('【以下为通用知识')) {
+          const n = document.createElement('div'); n.className = 'notice';
+          n.textContent = '本回答包含非课程资料的通用知识';
+          mdWrap.appendChild(n);
+        }
+      } catch (e) { /* 同上 */ }
     }
-
-    // 检索 Trace 视图：白盒展示"这次回答怎么检索的"——索引类型/向量规模/检索耗时/命中数
-    if (d.trace) {
-      const t = document.createElement('details'); t.className = 'trace';
-      const s = document.createElement('summary'); s.textContent = '检索详情（trace）';
-      const info = document.createElement('div');
-      info.textContent = '索引：' + d.trace.index + ' · 向量规模：' + d.trace.n_vectors +
-        ' · 检索耗时：' + (d.trace.search_ms || 0).toFixed(2) + ' ms · 命中 ' +
-        (d.citations || []).length + ' 条';
-      t.appendChild(s); t.appendChild(info);
-      answerEl.appendChild(t);
+  };
+  const flush = () => {
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      let name = '', dataStr = '';
+      for (const line of ev.split('\n')) {
+        if (line.startsWith('event:')) name = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+      }
+      handle(name, dataStr);
     }
-
-    // 引用卡片：title + 相似度进度条 + 点击懒加载原文（GET /chunk?id=）
-    const c = document.createElement('div');
-    c.className = 'cite';
-    (d.citations || []).forEach(ci => {
-      const card = document.createElement('div'); card.className = 'cite-card';
-      const h = document.createElement('div'); h.className = 'cite-title';
-      h.textContent = '《' + ci.course + '》' + (ci.title || '');
-      const row = document.createElement('div'); row.className = 'cite-row';
-      const bar = document.createElement('div'); bar.className = 'cite-bar';
-      const fill = document.createElement('div'); fill.className = 'cite-fill';
-      fill.style.width = Math.max(0, Math.min(1, ci.similarity)) * 100 + '%';
-      bar.appendChild(fill);
-      const sim = document.createElement('span'); sim.className = 'cite-sim';
-      sim.textContent = ci.similarity.toFixed(3);
-      row.appendChild(bar); row.appendChild(sim);
-      const btn = document.createElement('button'); btn.className = 'cite-btn'; btn.textContent = '查看原文';
-      const body = document.createElement('div'); body.className = 'cite-body'; body.hidden = true;
-      btn.onclick = () => {
-        if (body.hidden) { body.hidden = false; btn.textContent = '收起原文'; fetchChunk(ci.id, btn, body); }
-        else { body.hidden = true; btn.textContent = '查看原文'; }
-      };
-      card.appendChild(h); card.appendChild(row); card.appendChild(btn); card.appendChild(body);
-      c.appendChild(card);
-    });
-    answerEl.appendChild(c);
-  } catch (e) { answerEl.textContent = '网络错误：' + e; }
+  };
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      flush();
+    }
+    buf += dec.decode();
+    flush();
+  } catch (e) {
+    if (!doneSeen) mdWrap.textContent += '\n（网络中断）';
+  }
 }
 </script>
 </body>

@@ -32,6 +32,7 @@
 #include <core/log.hpp>
 #include <core/types.hpp>
 #include <rag/pipeline.hpp>
+#include <rag/llm_sse.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -428,6 +429,27 @@ int main() {
     };
 
     // ---- 5. Pipeline（engine 声明在前，保证比 pipeline 活得久）----
+    // 流式 LLM 出口（/ask/stream 用）：rag::llm_sse_post 完成 TLS + HTTP/1.1 +
+    // chunked + SSE 解析（httplib 客户端不支持流式 POST，见 rag/llm_sse.hpp 注释）。
+    // 超时语义沿用硬约束：连接 5s、读等待 30s = 两次数据块之间的最长等待，长回答靠
+    // 每块间隔 < 30s 维持不断；超过即 fail-fast 终止，不重试。
+    // on_delta 返回 false（客户端断开）时立即断开 LLM 流。
+    rag::Pipeline::LlmStreamFn llm_stream =
+        [llm_base = cfg.llm_base, llm_key = cfg.llm_key, llm_model = cfg.llm_model](
+            const std::string& prompt,
+            const std::function<bool(const std::string&)>& on_delta) -> bool {
+        const auto [cli_base, prefix] = rag::split_base_url(llm_base);
+        nlohmann::json body;
+        body["model"] = llm_model;
+        body["messages"] = nlohmann::json::array({
+            {{"role", "user"}, {"content", prompt}}});
+        body["stream"] = true;
+        body["temperature"] = 0.3;
+        return rag::llm_sse_post(cli_base, prefix, llm_key,
+                                 body.dump(-1, ' ', false,
+                                           nlohmann::json::error_handler_t::replace),
+                                 on_delta);
+    };
     rag::Pipeline pipeline(engine,
         rag::LlmConfig{cfg.llm_base, cfg.llm_key, cfg.llm_model},
         embed_query,
@@ -442,7 +464,7 @@ int main() {
             if (id >= metas.size())
                 throw std::out_of_range("fetch_meta: id " + std::to_string(id) + " out of range");
             return metas[id];
-        });
+        }, llm_stream);
 
     // ---- 6. 路由 ----
     httplib::Server svr;
@@ -550,6 +572,20 @@ int main() {
     svr.Post("/search", with_auth(search_handler, cfg.token));
 
     // POST /ask：embed（失败 502）→ Pipeline::ask（LLM 失败内部降级，仍 200）（包鉴权）
+    // 引用列表序列化（/ask 与 /ask/stream 共用）
+    const auto build_citations_json = [](const std::vector<rag::Citation>& citations) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& c : citations) {
+            arr.push_back({
+                {"id", c.id},
+                {"course", c.course},
+                {"semester", c.semester},
+                {"type", c.type_},
+                {"title", c.title},
+                {"similarity", c.similarity}});
+        }
+        return arr;
+    };
     auto ask_handler = [&](const httplib::Request& req, httplib::Response& res) {
         if (g_service_broken.load()) {
             send_error(res, 503, "server state inconsistent, restart required");
@@ -581,26 +617,74 @@ int main() {
         }
 
         const rag::AskResult r = pipeline.ask(query, k);
-        nlohmann::json citations = nlohmann::json::array();
-        for (const auto& c : r.citations) {
-            citations.push_back({
-                {"id", c.id},
-                {"course", c.course},
-                {"semester", c.semester},
-                {"type", c.type_},
-                {"title", c.title},
-                {"similarity", c.similarity}});
-        }
         nlohmann::json out = {
             {"answer", r.answer},
             {"llm_ok", r.llm_ok},
-            {"citations", std::move(citations)},
+            {"citations", build_citations_json(r.citations)},
             {"trace", {{"index", r.trace.index},
                        {"n_vectors", r.trace.n_vectors},
                        {"search_ms", r.trace.search_ms}}}};
         res.set_content(out.dump(), "application/json");
     };
     svr.Post("/ask", with_auth(ask_handler, cfg.token));
+
+    // POST /ask/stream：SSE 流式问答（包鉴权）。事件序：meta（citations+trace，先于
+    // 首字到达，上层先渲染引用）→ delta（LLM 增量文本，多帧）→ done（{llm_ok}）。
+    // llm_ok=false 时前端展示降级文案。实现用 chunked transfer encoding 推 SSE 帧；
+    // provider 运行在 httplib worker 线程，handler 返回后才执行，故 handler 只做校验。
+    auto ask_stream_handler = [&](const httplib::Request& req, httplib::Response& res) {
+        if (g_service_broken.load()) {
+            send_error(res, 503, "server state inconsistent, restart required");
+            return;
+        }
+        std::string query;
+        long long top_k = 0;
+        if (!parse_search_like_body(req, res, query, top_k)) return;
+        const size_t total = engine.size();
+        if (total == 0) {
+            send_error(res, 503, "index is empty");
+            return;
+        }
+        const size_t k = static_cast<size_t>(
+            std::min<long long>(top_k, static_cast<long long>(total)));
+        const std::vector<float> qv = embed_query(query);
+        if (qv.empty()) {
+            send_error(res, 502, "embedding request failed");
+            return;
+        }
+        if (qv.size() != static_cast<size_t>(dim)) {
+            send_error(res, 502, "embedding dimension mismatch");
+            return;
+        }
+        res.set_chunked_content_provider("text/event-stream",
+            [&pipeline, &build_citations_json, query, k](
+                size_t, httplib::DataSink& sink) -> bool {
+                pipeline.ask_stream(query, k,
+                    // on_meta：检索结果先于 LLM 首字推送，前端立即渲染引用与 trace
+                    [&sink, &build_citations_json](const rag::AskResult& meta) -> bool {
+                        nlohmann::json j;
+                        j["citations"] = build_citations_json(meta.citations);
+                        j["trace"] = {{"index", meta.trace.index},
+                                      {"n_vectors", meta.trace.n_vectors},
+                                      {"search_ms", meta.trace.search_ms}};
+                        const std::string frame = "event: meta\ndata: " + j.dump() + "\n\n";
+                        return sink.write(frame.data(), frame.size());
+                    },
+                    [&sink](const std::string& t) -> bool {
+                        nlohmann::json j = {{"text", t}};
+                        const std::string frame = "event: delta\ndata: " + j.dump() + "\n\n";
+                        return sink.write(frame.data(), frame.size());
+                    },
+                    [&sink](bool ok) {
+                        nlohmann::json j = {{"llm_ok", ok}};
+                        const std::string frame = "event: done\ndata: " + j.dump() + "\n\n";
+                        sink.write(frame.data(), frame.size());
+                    });
+                sink.done();
+                return true;
+            });
+    };
+    svr.Post("/ask/stream", with_auth(ask_stream_handler, cfg.token));
 
     // GET /chunk?id=N：按向量 id 取原文 + 元数据（引用卡片懒加载用）（包鉴权）。
     // id 来自 /ask 返回的 citations[].id；原文含任意文本，经 JSON 序列化返回，
