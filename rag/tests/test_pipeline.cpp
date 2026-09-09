@@ -109,7 +109,7 @@ TEST(Pipeline, AskStreamWithoutLlmStreamDegrades) {
     Pipeline p = make_pipeline(f);       // make_pipeline 不注入 llm_stream
     bool meta_called = false, done_called = false;
     std::vector<std::string> deltas;
-    p.ask_stream("什么是进程？", 2,
+    p.ask_stream("什么是进程？", 2, {},
         [&](const AskResult& m) {
             meta_called = true;
             EXPECT_FALSE(m.citations.empty());   // 检索结果照常可用
@@ -131,14 +131,14 @@ TEST(Pipeline, AskStreamWithInjectedLlmStreamFlows) {
                [&f](const std::string&) { return f.query_e0(); },
                [&f](uint32_t id) { return f.chunk_of(id); },
                [&f](uint32_t id) { return f.meta_of(id); },
-               [&](const std::string& prompt,
+               [&](const std::string& prompt, const ChatHistory&,
                    const std::function<bool(const std::string&)>& on_delta) -> bool {
                    seen_prompts.push_back(prompt);
                    return on_delta("一") && on_delta("二");
                });
     std::string joined;
     bool ok = false;
-    p.ask_stream("什么是进程？", 2,
+    p.ask_stream("什么是进程？", 2, {},
         [](const AskResult&) { return true; },
         [&](const std::string& t) { joined += t; return true; },
         [&](bool o) { ok = o; });
@@ -146,4 +146,48 @@ TEST(Pipeline, AskStreamWithInjectedLlmStreamFlows) {
     EXPECT_TRUE(ok);                     // 流完整成功 → on_done(true)
     ASSERT_EQ(seen_prompts.size(), 1u);
     EXPECT_NE(seen_prompts[0].find("什么是进程？"), std::string::npos);  // prompt 含问题
+}
+
+// 多轮历史透传（功能 D）：history 原样到达流式 LLM 出口（按 user/assistant 轮序），
+// 当前轮 prompt 仍只含当前问题——历史不进检索、不进当前 prompt
+TEST(Pipeline, AskStreamPassesHistoryToLlmStream) {
+    Fixture f;
+    ChatHistory captured;
+    Pipeline p(f.engine, {"http://127.0.0.1:1", "sk-test", "test-model"},
+               [&f](const std::string&) { return f.query_e0(); },
+               [&f](uint32_t id) { return f.chunk_of(id); },
+               [&f](uint32_t id) { return f.meta_of(id); },
+               [&](const std::string& prompt, const ChatHistory& history,
+                   const std::function<bool(const std::string&)>& on_delta) -> bool {
+                   captured = history;
+                   EXPECT_NE(prompt.find("当前问题"), std::string::npos);
+                   EXPECT_EQ(prompt.find("第一问"), std::string::npos);  // 历史不进 prompt
+                   return on_delta("答");
+               });
+    const ChatHistory history{{"第一问", "第一答"}, {"第二问", "第二答"}};
+    bool ok = false;
+    p.ask_stream("当前问题", 1, history,
+        [](const AskResult&) { return true; },
+        [](const std::string&) { return true; },
+        [&](bool o) { ok = o; });
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(captured.size(), 2u);      // 轮序原样保留（先到先放）
+    EXPECT_EQ(captured[0].first, "第一问");
+    EXPECT_EQ(captured[0].second, "第一答");
+    EXPECT_EQ(captured[1].first, "第二问");
+    EXPECT_EQ(captured[1].second, "第二答");
+}
+
+// ask() 带历史（功能 D）：检索与降级行为与无历史完全一致（LLM 失败 → 降级文案 +
+// citations），history 只影响 messages 构造，不影响检索链路
+TEST(Pipeline, AskWithHistoryDegradesSameWay) {
+    Fixture f;
+    Pipeline p = make_pipeline(f);
+    const ChatHistory history{{"前问", "前答"}};
+    const auto r = p.ask("当前问题", 2, history);
+    EXPECT_FALSE(r.llm_ok);
+    EXPECT_EQ(r.answer, "AI 服务暂不可用，以下为检索到的原文片段");
+    ASSERT_EQ(r.citations.size(), 2u);
+    EXPECT_EQ(r.citations[0].title, "T_0");
+    EXPECT_EQ(r.trace.n_vectors, f.engine.size());
 }

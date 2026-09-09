@@ -37,6 +37,10 @@
   /* ---- 检索 Trace 视图 ---- */
   .trace { margin-top: 12px; font-size: 13px; color: #57606a; border-top: 1px dashed #d8dee4; padding-top: 6px; }
   .trace summary { cursor: pointer; user-select: none; }
+  /* ---- 会话区（多轮问答，功能 D） ---- */
+  .turn { margin-top: 18px; }
+  .turn-q { background: #f0f6ff; border: 1px solid #d0e3ff; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; white-space: pre-wrap; word-break: break-word; }
+  .turn-a { }
 </style>
 </head>
 <body>
@@ -44,9 +48,10 @@
 <input type="text" id="token" placeholder="访问口令">
 <button onclick="saveToken()">保存口令</button>
 <br>
+<div id="chat"></div>
 <input type="text" id="q" placeholder="例如：死锁的四个必要条件是什么？">
 <button onclick="ask()">提问</button>
-<div id="answer"></div>
+<button onclick="newChat()">新对话</button>
 
 <script>
 // ================= 安全 Markdown 渲染 =================
@@ -89,6 +94,18 @@ function renderMd(src) {
 const saveToken = () => localStorage.setItem('rag_token', document.getElementById('token').value);
 document.getElementById('token').value = localStorage.getItem('rag_token') || '';
 document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
+
+// 多轮历史（功能 D）：已完成轮次 [{user, assistant}, ...]，按时间序先到先放。
+// 每轮提问时先 push 当前轮（assistant 留空），流结束后回填答案；"新对话"整体清空。
+// 发送时只回传最近 10 轮（上下文窗口控制），服务端另有 20 轮/4000 字符的硬上限。
+let history = [];
+
+// 新对话：清空历史与会话区（不会影响服务端任何状态——历史只活在浏览器内存里）
+const newChat = () => {
+  history = [];
+  document.getElementById('chat').innerHTML = '';
+  document.getElementById('q').focus();
+};
 
 async function fetchChunk(id, btn, body) {
   if (body.dataset.loaded) return;                      // 已加载不重复请求
@@ -146,29 +163,45 @@ function renderCites(citations, wrap) {
 }
 
 // 提问：SSE 流式（/ask/stream）。事件序 meta(引用+trace) → delta(增量文本) → done(llm_ok)
+// 多轮（功能 D）：每轮在会话区新增一个"问题+回答"块；历史轮次随请求回传，服务端
+// 原样前置给 LLM 作为追问上下文（见 server parse_history / rag messages 构造）。
 async function ask() {
   const q = document.getElementById('q').value;
-  const answerEl = document.getElementById('answer');
-  answerEl.innerHTML = '<p>检索中…</p>';
+  if (!q.trim()) return;
+  const chatEl = document.getElementById('chat');
+
+  // 本轮骨架：用户问题在上，回答区在下（含引用/trace）；先于网络请求渲染，
+  // 失败时历史里不留这条（见下方 history.pop()）
+  const turn = document.createElement('div'); turn.className = 'turn';
+  const qEl = document.createElement('div'); qEl.className = 'turn-q';
+  qEl.textContent = q;                                  // textContent：问题原文不渲染成 HTML
+  const aWrap = document.createElement('div'); aWrap.className = 'turn-a';
+  turn.appendChild(qEl); turn.appendChild(aWrap);
+  chatEl.appendChild(turn);
+  history.push({ user: q, assistant: '' });
+  aWrap.textContent = '检索中…';
+
   let resp;
   try {
+    const prev = history.slice(0, -1).slice(-10);       // 排除当前轮，只回传最近 10 轮
     resp = await fetch('/ask/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json',
                  'Authorization': 'Bearer ' + localStorage.getItem('rag_token') },
-      body: JSON.stringify({ query: q, top_k: 3 })   // 与服务端契约：query + top_k
+      body: JSON.stringify({ query: q, top_k: 3, history: prev })   // 契约：query + top_k + history
     });
-  } catch (e) { answerEl.textContent = '网络错误：' + e; return; }
-  if (resp.status === 401) { answerEl.textContent = '口令错误，请重新输入'; return; }
-  if (resp.status === 502) { answerEl.textContent = '检索服务暂时不可用，请稍后重试'; return; }
-  if (resp.status === 503) { answerEl.textContent = '知识库为空，暂无法回答'; return; }
-  if (!resp.ok || !resp.body) { answerEl.textContent = '请求失败：' + resp.status; return; }
+  } catch (e) { aWrap.textContent = '网络错误：' + e; history.pop(); return; }
+  if (resp.status === 401) { aWrap.textContent = '口令错误，请重新输入'; history.pop(); return; }
+  if (resp.status === 400) { aWrap.textContent = '请求参数错误（历史过长或格式不符）'; history.pop(); return; }
+  if (resp.status === 502) { aWrap.textContent = '检索服务暂时不可用，请稍后重试'; history.pop(); return; }
+  if (resp.status === 503) { aWrap.textContent = '知识库为空，暂无法回答'; history.pop(); return; }
+  if (!resp.ok || !resp.body) { aWrap.textContent = '请求失败：' + resp.status; history.pop(); return; }
 
   // 回答区固定两个容器：答案在上、引用在下，meta 先到也不影响 DOM 顺序
-  answerEl.innerHTML = '';
+  aWrap.textContent = '';
   const mdWrap = document.createElement('div'); mdWrap.className = 'md';
   const citeWrap = document.createElement('div'); citeWrap.className = 'cite';
-  answerEl.appendChild(mdWrap); answerEl.appendChild(citeWrap);
+  aWrap.appendChild(mdWrap); aWrap.appendChild(citeWrap);
 
   let buf = '', answerText = '', metaSeen = false, doneSeen = false;
   const handle = (name, dataStr) => {
@@ -229,6 +262,12 @@ async function ask() {
     flush();
   } catch (e) {
     if (!doneSeen) mdWrap.textContent += '\n（网络中断）';
+  } finally {
+    // 无论成败都回填本轮答案到历史（中断/失败时 assistant 为部分文本或空串），
+    // 供下一轮追问携带上下文；超出 20 轮丢弃最旧轮（服务端上限，浏览器侧先行裁）
+    if (history.length && history[history.length - 1].user === q)
+      history[history.length - 1].assistant = answerText;
+    history = history.slice(-20);
   }
 }
 </script>

@@ -56,6 +56,8 @@ namespace {
 constexpr size_t kPayloadMax = 64 * 1024 * 1024 + 1024;   // 全局入库包上限，超限 httplib 自动 413
 constexpr size_t kQueryBodyMax = 64 * 1024;               // /search /ask 请求体上限（路由内自查）
 constexpr size_t kQueryCharMax = 2000;                    // query 字符数上限（按 UTF-8 字符计）
+constexpr size_t kHistoryTurnMax = 20;                    // 多轮历史最大轮数
+constexpr size_t kHistoryMsgCharMax = 4000;               // 历史单条消息最大字符数（按 UTF-8 字符计）
 constexpr const char* kConfigPath = "server_config.json"; // 真实配置（.gitignore 排除），模板见 server_config.example.json
 
 // chunks.json 内存副本的并发保护：/documents 追加会让 vector 重新分配，与 Pipeline
@@ -245,9 +247,11 @@ void send_error(httplib::Response& res, int status, const std::string& msg) {
 }
 
 // /search 与 /ask 共用的请求校验：请求体大小 + JSON 解析 + query/top_k 合法性。
-// 失败时填好 400 响应并返回 false；成功时通过出参带出 query/top_k
+// 失败时填好 400 响应并返回 false；成功时通过出参带出 query/top_k 与解析后的 JSON
+// （j_out 供 /ask 路由继续读可选 history 字段，/search 不用）。
 bool parse_search_like_body(const httplib::Request& req, httplib::Response& res,
-                            std::string& query, long long& top_k) {
+                            std::string& query, long long& top_k,
+                            nlohmann::json& j_out) {
     if (req.body.size() > kQueryBodyMax) {
         send_error(res, 400, "request body exceeds " + std::to_string(kQueryBodyMax)
                                + " bytes limit");
@@ -283,6 +287,31 @@ bool parse_search_like_body(const httplib::Request& req, httplib::Response& res,
     if (top_k <= 0) {
         send_error(res, 400, "field \"top_k\" must be a positive integer");
         return false;
+    }
+    j_out = j;
+    return true;
+}
+
+// 解析可选多轮历史（功能 D）：/ask /ask/stream 请求体里的 "history" 字段，缺省 = 单轮。
+// 格式：JSON 数组，每项 {user, assistant} 均为字符串，按时间序先到先放。
+// 校验硬约束（外部输入边界）：轮数 ≤ kHistoryTurnMax、单条消息 ≤ kHistoryMsgCharMax
+// （按字符计，与 query 同口径）——历史随每轮请求透传进 LLM 上下文，无界历史会让
+// 请求体与 LLM 输入一起膨胀。成功返回 true（缺省也为 true，history 为空）。
+bool parse_history(const nlohmann::json& j, rag::ChatHistory& history) {
+    if (!j.contains("history")) return true;
+    const auto& h = j["history"];
+    if (!h.is_array() || h.size() > kHistoryTurnMax) return false;
+    for (size_t i = 0; i < h.size(); ++i) {
+        const auto& it = h[i];
+        if (!it.is_object() || !it.contains("user") || !it["user"].is_string() ||
+            !it.contains("assistant") || !it["assistant"].is_string()) {
+            return false;
+        }
+        const std::string u = it["user"].get<std::string>();
+        const std::string a = it["assistant"].get<std::string>();
+        if (utf8_length(u) > kHistoryMsgCharMax || utf8_length(a) > kHistoryMsgCharMax)
+            return false;
+        history.emplace_back(std::move(u), std::move(a));
     }
     return true;
 }
@@ -434,15 +463,22 @@ int main() {
     // 超时语义沿用硬约束：连接 5s、读等待 30s = 两次数据块之间的最长等待，长回答靠
     // 每块间隔 < 30s 维持不断；超过即 fail-fast 终止，不重试。
     // on_delta 返回 false（客户端断开）时立即断开 LLM 流。
+    // history（功能 D）：历史轮次按 user/assistant 原样前置，当前轮 prompt 收尾
+    // ——与 Pipeline::call_llm 的 messages 构造保持一致（见 pipeline.cpp）。
     rag::Pipeline::LlmStreamFn llm_stream =
         [llm_base = cfg.llm_base, llm_key = cfg.llm_key, llm_model = cfg.llm_model](
-            const std::string& prompt,
+            const std::string& prompt, const rag::ChatHistory& history,
             const std::function<bool(const std::string&)>& on_delta) -> bool {
         const auto [cli_base, prefix] = rag::split_base_url(llm_base);
         nlohmann::json body;
         body["model"] = llm_model;
-        body["messages"] = nlohmann::json::array({
-            {{"role", "user"}, {"content", prompt}}});
+        nlohmann::json messages = nlohmann::json::array();
+        for (const auto& [q, a] : history) {
+            messages.push_back({{"role", "user"}, {"content", q}});
+            messages.push_back({{"role", "assistant"}, {"content", a}});
+        }
+        messages.push_back({{"role", "user"}, {"content", prompt}});
+        body["messages"] = std::move(messages);
         body["stream"] = true;
         body["temperature"] = 0.3;
         return rag::llm_sse_post(cli_base, prefix, llm_key,
@@ -511,7 +547,8 @@ int main() {
         }
         std::string query;
         long long top_k = 0;
-        if (!parse_search_like_body(req, res, query, top_k)) return;
+        nlohmann::json body_j;
+        if (!parse_search_like_body(req, res, query, top_k, body_j)) return;
 
         // 超容量 clamp 到当前条数；空索引时 k=0，直接返回空结果，不进 engine.search
         // （不依赖 core 的边界语义）
@@ -593,7 +630,16 @@ int main() {
         }
         std::string query;
         long long top_k = 0;
-        if (!parse_search_like_body(req, res, query, top_k)) return;
+        nlohmann::json body_j;
+        if (!parse_search_like_body(req, res, query, top_k, body_j)) return;
+        rag::ChatHistory history;
+        if (!parse_history(body_j, history)) {
+            send_error(res, 400, "invalid field \"history\": expected array of "
+                       "{\"user\", \"assistant\"} string pairs, at most "
+                       + std::to_string(kHistoryTurnMax) + " turns, each message at most "
+                       + std::to_string(kHistoryMsgCharMax) + " characters");
+            return;
+        }
 
         // 空索引直接 503：问答必须产出 LLM 答案，对空资料区发起只会白费一次 LLM 调用
         // （/search 空集可无外呼返回 200 空结果，两路由语义不同故处理不同）
@@ -616,7 +662,7 @@ int main() {
             return;
         }
 
-        const rag::AskResult r = pipeline.ask(query, k);
+        const rag::AskResult r = pipeline.ask(query, k, history);
         nlohmann::json out = {
             {"answer", r.answer},
             {"llm_ok", r.llm_ok},
@@ -639,7 +685,16 @@ int main() {
         }
         std::string query;
         long long top_k = 0;
-        if (!parse_search_like_body(req, res, query, top_k)) return;
+        nlohmann::json body_j;
+        if (!parse_search_like_body(req, res, query, top_k, body_j)) return;
+        rag::ChatHistory history;
+        if (!parse_history(body_j, history)) {
+            send_error(res, 400, "invalid field \"history\": expected array of "
+                       "{\"user\", \"assistant\"} string pairs, at most "
+                       + std::to_string(kHistoryTurnMax) + " turns, each message at most "
+                       + std::to_string(kHistoryMsgCharMax) + " characters");
+            return;
+        }
         const size_t total = engine.size();
         if (total == 0) {
             send_error(res, 503, "index is empty");
@@ -656,10 +711,12 @@ int main() {
             send_error(res, 502, "embedding dimension mismatch");
             return;
         }
+        // history/query 按值捕获进 provider lambda：chunked provider 运行在 httplib
+        // worker 线程、handler 返回后才执行，值捕获保证其生命周期独立于本 handler 栈
         res.set_chunked_content_provider("text/event-stream",
-            [&pipeline, &build_citations_json, query, k](
+            [&pipeline, &build_citations_json, query, k, history](
                 size_t, httplib::DataSink& sink) -> bool {
-                pipeline.ask_stream(query, k,
+                pipeline.ask_stream(query, k, history,
                     // on_meta：检索结果先于 LLM 首字推送，前端立即渲染引用与 trace
                     [&sink, &build_citations_json](const rag::AskResult& meta) -> bool {
                         nlohmann::json j;

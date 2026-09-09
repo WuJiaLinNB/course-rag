@@ -47,6 +47,13 @@ struct LlmConfig {
     std::string base_url, api_key, model;
 };
 
+// 多轮对话历史：一轮 = 用户提问 + 助手回答 的原文对（按时间序，先到先放）。
+// 语义：当前轮的规则/资料/问题只进当前 user 消息；历史轮次作为前置
+// user/assistant 消息原样透传给 LLM，供其理解"刚才聊过什么"（追问场景）。
+// 上限（轮数/单条字符数）由 server 层校验（kHistoryTurnMax/kHistoryMsgCharMax）；
+// 无界历史会让请求体与 LLM 上下文一起膨胀，属外部输入边界。
+using ChatHistory = std::vector<std::pair<std::string, std::string>>;
+
 // 检索增强问答流水线：embedding → engine.search → 拼 prompt → 调 LLM。
 //
 // 过关自测（三个 WHY，长期保留）：
@@ -65,8 +72,11 @@ public:
     // 流式 LLM 出口：调用方注入真实实现（httplib Client + stream:true + SSE 解析）。
     // 返回 true 表示流完整成功；on_delta 逐块回调增量文本，返回 false 表示客户端已断开，
     // 调用方应尽快终止（fail-fast，不重试）。
+    // history 语义与 call_llm 一致：历史轮次按 user/assistant 消息原样前置，
+    // 当前轮 prompt（规则+资料+问题）作为最后一条 user 消息。
     using LlmStreamFn =
         std::function<bool(const std::string& prompt,
+                           const ChatHistory& history,
                            const std::function<bool(const std::string&)>& on_delta)>;
 
     // engine_ 必须比 Pipeline 活得久（server 层二者同生命周期）
@@ -77,13 +87,15 @@ public:
              std::function<core::ChunkMeta(uint32_t id)> fetch_meta,
              // 可选流式 LLM 出口；默认空 = ask_stream 走降级（on_done(false)）
              LlmStreamFn llm_stream = {});
-    AskResult ask(const std::string& question, size_t top_k) const;
+    AskResult ask(const std::string& question, size_t top_k,
+                  const ChatHistory& history = {}) const;
 
     // 流式问答：先同步检索，on_meta 回传 citations + trace（answer 为空），随后 LLM 增量
     // 文本经 on_delta 逐块回调（回调返回 false 立即终止，视为客户端断开）；结束统一
     // on_done(llm_ok)。llm_stream_ 未注入或调用失败 → 仍回调 on_done(false)，上层据此
-    // 展示降级文案（与 ask() 的 llm_ok 语义一致）。
+    // 展示降级文案（与 ask() 的 llm_ok 语义一致）。history 透传给 llm_stream_（见上）。
     void ask_stream(const std::string& question, size_t top_k,
+                    const ChatHistory& history,
                     const std::function<bool(const AskResult&)>& on_meta,
                     const std::function<bool(const std::string&)>& on_delta,
                     const std::function<void(bool)>& on_done) const;
@@ -100,7 +112,8 @@ private:
     std::function<std::string(uint32_t id)> fetch_chunk_;
     std::function<core::ChunkMeta(uint32_t id)> fetch_meta_;
     LlmStreamFn llm_stream_;
-    std::string call_llm(const std::string& prompt) const;   // 失败返回 ""
+    std::string call_llm(const std::string& prompt, const ChatHistory& history) const;
+    // 失败返回 ""
 };
 
 } // namespace rag

@@ -17,7 +17,8 @@ Pipeline::Pipeline(core::Engine& engine, LlmConfig cfg,
       fetch_meta_(std::move(fetch_meta)),
       llm_stream_(std::move(llm_stream)) {}
 
-AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
+AskResult Pipeline::ask(const std::string& question, size_t top_k,
+                        const ChatHistory& history) const {
     // 检索先行：无论 LLM 成败，检索命中都要组装成 citations 返回（见头文件自测 1）
     const auto qv = embed_query_(question);
     const auto t0 = std::chrono::steady_clock::now();
@@ -32,7 +33,7 @@ AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
         citations.push_back({h.id, m.course, m.semester, m.type_, m.title, h.similarity});
     }
 
-    const std::string answer = call_llm(build_prompt_(question, hits));
+    const std::string answer = call_llm(build_prompt_(question, hits), history);
     if (answer.empty()) {
         // LLM 失败 → 固定降级文案 + 保留 citations；llm_ok=false 让上层能区分降级与正常回答
         return {"AI 服务暂不可用，以下为检索到的原文片段", std::move(citations), false,
@@ -42,6 +43,7 @@ AskResult Pipeline::ask(const std::string& question, size_t top_k) const {
 }
 
 void Pipeline::ask_stream(const std::string& question, size_t top_k,
+                          const ChatHistory& history,
                           const std::function<bool(const AskResult&)>& on_meta,
                           const std::function<bool(const std::string&)>& on_delta,
                           const std::function<void(bool)>& on_done) const {
@@ -70,7 +72,7 @@ void Pipeline::ask_stream(const std::string& question, size_t top_k,
     // 流式 LLM 阶段：llm_stream_ 未注入（如测试/无流式配置）→ 走降级。
     // on_delta 返回 false = 客户端断开，立即终止，不再调 on_done（连接已死，写了也没人收）。
     if (!llm_stream_) { on_done(false); return; }
-    const bool ok = llm_stream_(build_prompt_(question, hits), on_delta);
+    const bool ok = llm_stream_(build_prompt_(question, hits), history, on_delta);
     if (ok) {
         on_done(true);
     } else {
@@ -103,13 +105,18 @@ std::string Pipeline::build_prompt_(const std::string& question,
 
 // OpenAI 兼容 /chat/completions。失败一律返回 ""（上层统一走降级文案），绝不抛异常。
 //
+// 多轮 messages 构造（功能 D）：历史轮次按 user/assistant 原样前置——每轮一问一答
+// 两条消息按时间序先到先放；当前轮 prompt（规则+资料+问题，见 build_prompt_）作为
+// 最后一条 user 消息。当前轮检索上下文只进当前消息，不混入历史轮次。
+//
 // TLS（Task 16 前置）：Windows 构建由 CMake 定义 CPPHTTPLIB_OPENSSL_SUPPORT
 // （vendored OpenSSL），https 端点可直连；未定义时（CI/旧配置）https 会连接失败
 // 走降级路径。仅出站客户端——入站 TLS 由公网隧道层终结（设计文档第 14 节）。
 //
 // 超时策略（见头文件自测 3）：连接 5s（与 server 层在线 embedding 查询同款）、
 // 读 30s、失败不重试直接降级——重试叠加秒级超时会拖垮调用线程。
-std::string Pipeline::call_llm(const std::string& prompt) const {
+std::string Pipeline::call_llm(const std::string& prompt,
+                               const ChatHistory& history) const {
     // httplib 0.15.3 Client 构造不接受带路径的 base_url：先拆出可连部分 + 路径前缀
     // （见 pipeline.hpp split_base_url 注释），请求路径 = prefix + "/chat/completions"
     const auto [cli_base, prefix] = split_base_url(llm_.base_url);
@@ -119,12 +126,18 @@ std::string Pipeline::call_llm(const std::string& prompt) const {
     if (!llm_.api_key.empty())
         cli.set_bearer_token_auth(llm_.api_key);
 
-    // 请求体用 nlohmann 构造：prompt 含任意文本（引号/换行/反斜杠），手拼 JSON 必漏转义；
-    // dump 指定 error_handler_t::replace——原文若含非法 UTF-8，替换成 U+FFFD 而不是抛异常
+    // 请求体用 nlohmann 构造：prompt/历史含任意文本（引号/换行/反斜杠），手拼 JSON
+    // 必漏转义；dump 指定 error_handler_t::replace——原文若含非法 UTF-8，替换成 U+FFFD
+    // 而不是抛异常。
     nlohmann::json body;
     body["model"] = llm_.model;
-    body["messages"] = nlohmann::json::array({
-        {{"role", "user"}, {"content", prompt}}});
+    nlohmann::json messages = nlohmann::json::array();
+    for (const auto& [q, a] : history) {       // 历史轮次原样前置（追问上下文）
+        messages.push_back({{"role", "user"}, {"content", q}});
+        messages.push_back({{"role", "assistant"}, {"content", a}});
+    }
+    messages.push_back({{"role", "user"}, {"content", prompt}});
+    body["messages"] = std::move(messages);
 
     const auto res = cli.Post(prefix + "/chat/completions", body.dump(
         -1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");

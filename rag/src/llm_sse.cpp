@@ -122,6 +122,23 @@ bool read_line(SSL* ssl, SockT fd, std::string& leftover, std::string& line,
     }
 }
 
+// 缓冲读：优先从 leftover 取（read_line 可能已把后续数据一并读入 leftover），
+// 取不够再从 socket 补。body 的所有读取必须走这里——直接 sock_read 会绕过 leftover
+// 里已缓冲的数据，导致 chunk 边界与 leftover 内容错位（曾引发只收到第一帧就误把
+// JSON 字节当 chunk size 解析、提前结束流的问题）。
+int sock_read_buf(SSL* ssl, SockT fd, std::string& leftover,
+                  char* out, size_t len, int timeout_ms) {
+    if (!leftover.empty()) {
+        // 不用 std::min(a,b) 裸调：MSVC 下 windows.h 的 min 宏会把它展开成 (a)<(b)?…
+        // 导致 C2589；显式三目无此问题
+        const size_t take = len < leftover.size() ? len : leftover.size();
+        std::memcpy(out, leftover.data(), take);
+        leftover.erase(0, take);
+        return static_cast<int>(take);
+    }
+    return sock_read(ssl, fd, out, len, timeout_ms);
+}
+
 // ---- SSE 增量解析：喂原始字节，吐出 choices[0].delta.content 给 on_delta ----
 
 struct SseParser {
@@ -401,7 +418,7 @@ bool llm_sse_post(const std::string& cli_base, const std::string& path_prefix,
                 long long got = 0;
                 char buf[8192];
                 while (got < n) {
-                    const int r = sock_read(ssl, fd, buf,
+                    const int r = sock_read_buf(ssl, fd, leftover, buf,
                         static_cast<size_t>(std::min<long long>(sizeof buf, n - got)),
                         30000);
                     if (r <= 0) goto fail;
@@ -409,13 +426,13 @@ bool llm_sse_post(const std::string& cli_base, const std::string& path_prefix,
                     got += r;
                 }
                 char crlf[2];
-                if (sock_read(ssl, fd, crlf, 2, 30000) != 2) goto fail;   // 尾 CRLF
+                if (sock_read_buf(ssl, fd, leftover, crlf, 2, 30000) != 2) goto fail;
             }
         } else if (content_length >= 0) {
             long long got = 0;
             char buf[8192];
             while (got < content_length) {
-                const int r = sock_read(ssl, fd, buf,
+                const int r = sock_read_buf(ssl, fd, leftover, buf,
                     static_cast<size_t>(std::min<long long>(sizeof buf,
                                                             content_length - got)),
                     30000);
@@ -427,7 +444,7 @@ bool llm_sse_post(const std::string& cli_base, const std::string& path_prefix,
             // 无长度无 chunked：读到连接关闭（Connection: close）
             char buf[8192];
             for (;;) {
-                const int r = sock_read(ssl, fd, buf, sizeof buf, 30000);
+                const int r = sock_read_buf(ssl, fd, leftover, buf, sizeof buf, 30000);
                 if (r <= 0) break;
                 if (!parser.feed(buf, static_cast<size_t>(r))) goto fail;
             }
