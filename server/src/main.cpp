@@ -292,7 +292,11 @@ std::vector<float> embed_query_once(const std::string& base_url,
                                     const std::string& api_key,
                                     const std::string& model,
                                     const std::string& query) {
-    httplib::Client cli(base_url);
+    // httplib 0.15.3 Client 构造不接受带路径的 base_url（见 rag/pipeline.hpp
+    // split_base_url 注释）：base_url 如 "https://api.siliconflow.cn/v1" 时先拆出
+    // 可连部分 + 路径前缀，请求路径 = prefix + "/embeddings"
+    const auto [cli_base, prefix] = rag::split_base_url(base_url);
+    httplib::Client cli(cli_base);
     cli.set_connection_timeout(5);
     cli.set_read_timeout(5);
     if (!api_key.empty()) cli.set_bearer_token_auth(api_key);
@@ -300,7 +304,7 @@ std::vector<float> embed_query_once(const std::string& base_url,
     nlohmann::json body;
     body["model"] = model;
     body["input"] = nlohmann::json::array({query});
-    const auto res = cli.Post("/embeddings", body.dump(-1, ' ', false,
+    const auto res = cli.Post(prefix + "/embeddings", body.dump(-1, ' ', false,
                               nlohmann::json::error_handler_t::replace), "application/json");
     if (!res) {   // 连接失败/超时/不支持 http scheme
         LOG_WARN("embed request failed: %s", httplib::to_string(res.error()).c_str());

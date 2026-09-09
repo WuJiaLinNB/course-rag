@@ -63,7 +63,10 @@ std::string Pipeline::build_prompt_(const std::string& question,
 // 超时策略（见头文件自测 3）：连接 5s（与 server 层在线 embedding 查询同款）、
 // 读 30s、失败不重试直接降级——重试叠加秒级超时会拖垮调用线程。
 std::string Pipeline::call_llm(const std::string& prompt) const {
-    httplib::Client cli(llm_.base_url);
+    // httplib 0.15.3 Client 构造不接受带路径的 base_url：先拆出可连部分 + 路径前缀
+    // （见 pipeline.hpp split_base_url 注释），请求路径 = prefix + "/chat/completions"
+    const auto [cli_base, prefix] = split_base_url(llm_.base_url);
+    httplib::Client cli(cli_base);
     cli.set_connection_timeout(5);
     cli.set_read_timeout(30);
     if (!llm_.api_key.empty())
@@ -76,7 +79,7 @@ std::string Pipeline::call_llm(const std::string& prompt) const {
     body["messages"] = nlohmann::json::array({
         {{"role", "user"}, {"content", prompt}}});
 
-    const auto res = cli.Post("/chat/completions", body.dump(
+    const auto res = cli.Post(prefix + "/chat/completions", body.dump(
         -1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     if (!res) {                                 // 连接失败/超时/不支持 http scheme
         LOG_WARN("llm request failed: %s", httplib::to_string(res.error()).c_str());

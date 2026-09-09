@@ -1,10 +1,24 @@
-﻿#pragma once
+#pragma once
 #include <core/engine.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 #include <functional>
 
 namespace rag {
+
+// httplib 0.15.3 的 Client(scheme_host_port) 构造函数只接受 "scheme://host[:port]"：
+// 带路径前缀（如 "https://api.example.com/v1"）会被正则整体匹配失败，把整个串当
+// host 去连 80 端口 → 连接必失败。拆成可构造 Client 的部分 + 请求路径前缀，
+// 调用方以 "prefix + /xxx" 作为请求路径。base_url 无路径时 prefix 为空串，行为不变。
+inline std::pair<std::string, std::string> split_base_url(const std::string& base_url) {
+    const auto scheme_end = base_url.find("://");
+    if (scheme_end == std::string::npos) return {base_url, ""};
+    const auto host_start = scheme_end + 3;
+    const auto slash = base_url.find('/', host_start);
+    if (slash == std::string::npos) return {base_url, ""};
+    return {base_url.substr(0, slash), base_url.substr(slash)};
+}
 
 // 一条引用（出处卡片）：检索命中的元数据 + 相似度，随答案一起展示给用户
 struct Citation {
